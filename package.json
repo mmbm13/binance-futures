@@ -1,0 +1,27 @@
+{
+  "name": "binance-bot-2",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "npx ts-node src/test-connections.ts",
+    "start": "npx ts-node src/api/server.ts",
+    "db:init": "npx ts-node src/db/init.ts",
+    "db:migrate": "npx ts-node src/db/migrate.ts",
+    "build": "npx tsc",
+    "start:prod": "node dist/api/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@types/pg": "^8.16.0",
+    "binance": "^3.4.3",
+    "dotenv": "^17.3.1",
+    "fastify": "^5.7.4",
+    "pg": "^8.18.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "winston": "^3.19.0"
+  }
+}
