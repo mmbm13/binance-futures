@@ -1,15 +1,30 @@
 import Fastify from 'fastify';
-import { botEngine } from '../bot/engine';
+import fs from 'fs';
+import path from 'path';
+import { botEngine, SYMBOL } from '../bot/engine';
 import { db } from '../db';
 import * as dotenv from 'dotenv';
 import { stateManager } from '../bot/state';
 import { wsManager } from '../bot/websocket';
 import { client } from '../bot/client';
 import { logger } from '../utils/logger';
+import {
+  buildCycleMetrics,
+  computeTradeMetrics,
+  fetchAllTrades,
+  fetchRecentTrades,
+} from '../bot/metrics';
+import { requireApiKey } from './auth';
+import {
+  getLogFilePath,
+  getLogFileStats,
+  readLogTail,
+  readLogTailAsText,
+  resolveLogFile,
+} from './logReader';
 
 dotenv.config();
 
-const SYMBOL = 'ETHUSDT';
 const fastify = Fastify({ logger: true });
 
 // Start Bot
@@ -24,16 +39,19 @@ fastify.post('/start', async (_request, reply) => {
     await botEngine.init();
     await wsManager.start();
   } else {
-    // If already initialized, sync state with Binance
-    // This will trigger handleIdle() if in IDLE state with no orders
+    // If already initialized, sync state with Binance.
+    // This starts a fresh cycle (order book collection) when flat.
     await botEngine.syncStateWithBinance();
   }
   return { status: 'started' };
 });
 
-// Stop Bot — cancels all open orders for safety
+// Stop Bot — stops collection timers/streams and cancels all open orders
 fastify.post('/stop', async (_request, reply) => {
   await stateManager.updateStatus('STOPPED');
+
+  // Stop order book collection / timers
+  await botEngine.stop();
 
   // Cancel all open orders (regular + algo) to prevent orphaned orders
   try {
@@ -50,10 +68,14 @@ fastify.post('/stop', async (_request, reply) => {
 // Get Status
 fastify.get('/status', async (_request, _reply) => {
   const state = await stateManager.getState();
-  const recentTradesRes = await db.query('SELECT * FROM trades ORDER BY closed_at DESC LIMIT 5');
+  const allTrades = await fetchAllTrades(db);
+  const recentTrades = await fetchRecentTrades(db, 5);
+
   return {
     state,
-    recentTrades: recentTradesRes.rows
+    cycle: buildCycleMetrics(state, botEngine.ladder, botEngine.tickSize),
+    performance: computeTradeMetrics(allTrades),
+    recentTrades,
   };
 });
 
@@ -61,6 +83,52 @@ fastify.get('/status', async (_request, _reply) => {
 fastify.get('/history', async (_request, _reply) => {
   const res = await db.query('SELECT * FROM trades ORDER BY closed_at DESC LIMIT 100');
   return res.rows;
+});
+
+// ─── Logs (remote access without SSH) ───────────────────────────────────────
+fastify.get('/logs', async (request, reply) => {
+  if (!requireApiKey(request, reply)) return;
+
+  const q = request.query as {
+    lines?: string;
+    file?: string;
+    level?: string;
+    search?: string;
+    format?: string;
+  };
+
+  const file = resolveLogFile(q.file);
+  const lines = q.lines ? Number(q.lines) : 200;
+  const opts = { file, lines, level: q.level, search: q.search };
+
+  if (q.format === 'text') {
+    reply.type('text/plain; charset=utf-8');
+    return readLogTailAsText(opts);
+  }
+
+  const result = readLogTail(opts);
+  return {
+    file: result.file,
+    returned: result.entries.length,
+    totalInFile: result.total,
+    stats: getLogFileStats(file),
+    entries: result.entries,
+  };
+});
+
+fastify.get('/logs/download', async (request, reply) => {
+  if (!requireApiKey(request, reply)) return;
+
+  const file = resolveLogFile((request.query as { file?: string }).file);
+  const filePath = getLogFilePath(file);
+  if (!getLogFileStats(file).exists) {
+    return reply.code(404).send({ error: 'Log file not found' });
+  }
+
+  return reply
+    .header('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`)
+    .type('text/plain')
+    .send(fs.readFileSync(filePath, 'utf8'));
 });
 
 // ─── Startup ─────────────────────────────────────────────────────────────────

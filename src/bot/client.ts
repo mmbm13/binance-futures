@@ -18,6 +18,7 @@ export const client = new USDMClient({
   api_key: API_KEY,
   api_secret: API_SECRET,
   testnet: USE_TESTNET,
+  disableTimeSync: false
 });
 
 export const checkConnection = async () => {

@@ -3,7 +3,10 @@ import path from 'path';
 import fs from 'fs';
 
 // Ensure logs directory exists
-const logsDir = path.join(process.cwd(), 'logs');
+export const logsDir = path.join(process.cwd(), 'logs');
+export const combinedLogPath = path.join(logsDir, 'combined.log');
+export const errorLogPath = path.join(logsDir, 'error.log');
+
 if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
@@ -37,13 +40,13 @@ export const logger = winston.createLogger({
   transports: [
     // Write all logs to combined.log
     new winston.transports.File({
-      filename: path.join(logsDir, 'combined.log'),
+      filename: combinedLogPath,
       maxsize: 10485760, // 10MB
       maxFiles: 5,
     }),
     // Write errors to error.log
     new winston.transports.File({
-      filename: path.join(logsDir, 'error.log'),
+      filename: errorLogPath,
       level: 'error',
       maxsize: 10485760, // 10MB
       maxFiles: 5,

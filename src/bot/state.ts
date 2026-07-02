@@ -1,7 +1,13 @@
 import { db } from '../db';
 
 export type BotStatus = 'RUNNING' | 'STOPPED';
-export type BotPhase = 'IDLE' | 'WAITING_ENTRY' | 'IN_POSITION';
+export type BotPhase =
+  | 'IDLE'
+  | 'COLLECTING'
+  | 'WAITING_ENTRY'
+  | 'BUILDING'
+  | 'HARVESTING'
+  | 'IN_POSITION'; // legacy alias treated as BUILDING
 
 export interface BotState {
   status: BotStatus;

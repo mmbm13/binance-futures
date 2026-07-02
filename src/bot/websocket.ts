@@ -84,7 +84,13 @@ export const wsManager = {
       // Handle regular Order Update (ORDER_TRADE_UPDATE)
       if (data.eventType === 'ORDER_TRADE_UPDATE') {
         const order = data.order as any;
-        logger.info('[WS] Order Update format message', { symbol: order.symbol, side: order.side, status: order.orderStatus, type: order.orderType, orderId: order.orderId });
+        logger.info('[WS] Order Update format message', {
+          symbol: order.symbol,
+          side: order.side,
+          status: order.orderStatus,
+          type: order.orderType,
+          clientOrderId: order.clientOrderId,
+        });
 
         try {
           await botEngine.handleOrderUpdate(data);

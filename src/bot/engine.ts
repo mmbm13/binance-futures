@@ -1,101 +1,158 @@
-
 import { client } from './client';
-import { stateManager, BotState } from './state';
-import { NewFuturesOrderParams } from 'binance';
+import { stateManager, BotState, BotPhase } from './state';
+import { orderBookCollector } from './orderbook';
 import { randomUUID } from 'crypto';
 import { logger } from '../utils/logger';
 
+export { SYMBOL } from './config';
+import {
+  SYMBOL,
+  LEVERAGE,
+  LADDER_LEVELS,
+  LADDER_SIZE_MULT,
+  ACCOUNT_RISK_PERCENT,
+  TP_REWARD_RATIO,
+  MIN_LADDER_SPACING_PCT,
+  MAX_LADDER_SPACING_PCT,
+  MAKER_FEE,
+} from './config';
+import { LadderState, SymbolPrecision } from './types';
+import { sleep } from './math';
+import {
+  getAccountBalance,
+  getPosition,
+  cancelAllOrders,
+  isOpenOnExchange,
+  syncLadderWithExchange,
+  countExchangeEntryOrders,
+  syncLadderSideFromPosition,
+} from './exchange';
+import { enterCollectPhase, stopCollectTimer } from './phases/collectPhase';
+import { placeStraddleOrders } from './phases/straddlePhase';
+import {
+  handleFirstFill,
+  handleSubsequentFill,
+  placeLadderOrders as runPlaceLadderOrders,
+  needsLadderPlacement,
+  refreshLadderWalls,
+  persistLadderState,
+  BuildPhaseHost,
+} from './phases/buildPhase';
+import {
+  canEvaluatePartialClose,
+  executePartialClose,
+  HarvestPhaseHost,
+} from './phases/harvestPhase';
+import {
+  refreshExits as runRefreshExits,
+  finalizeCycle as runFinalizeCycle,
+  ExitPhaseHost,
+} from './phases/exitPhase';
+import { isInTradePhase, resolveCyclePhase, botPhaseForLadder } from './phases/types';
+import { isHarvestMode, repairHarvestState } from './phases/harvestMode';
 
-// ─── Configuration ───────────────────────────────────────────────────────────
-const SYMBOL = 'ETHUSDT';
-const LEVERAGE = 60;
-const RISK_PER_TRADE = 0.01;        // 1% of account balance
-const STOP_LOSS_PERCENT = 0.01;     // 1% price movement
-const TAKE_PROFIT_PERCENT = 0.02;   // 2% price movement (2:1 R:R)
-const ENTRY_OFFSET = 0.02;          // 2% offset for entry orders
-const RISK_BUFFER = 0.90;           // 10% safety buffer for fees & slippage
-
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-async function getAccountBalance(): Promise<number> {
-  const res = await client.getAccountInformationV3();
-  const asset = res.assets.find((a: any) => a.asset === 'USDT');
-  return asset ? parseFloat(asset.walletBalance as string) : 0;
-}
-
-function roundStep(value: number, step: number): number {
-  if (step === 0) return value;
-  const inv = 1.0 / step;
-  return Math.round(value * inv) / inv;
-}
-
-function floorStep(value: number, step: number): number {
-  if (step === 0) return value;
-  const inv = 1.0 / step;
-  return Math.floor(value * inv) / inv;
-}
-
-/**
- * Cancel ALL orders for the symbol — both regular orders and algo orders.
- * Since Dec 2025 Binance moved conditional orders (STOP_MARKET, etc.) to Algo API,
- * so we must cancel both types to fully clean up.
- */
-async function cancelAllOrders(): Promise<void> {
-  try {
-    await client.cancelAllOpenOrders({ symbol: SYMBOL });
-  } catch (_) {
-    // Ignore — no regular open orders is fine
-  }
-  try {
-    await client.cancelAllAlgoOpenOrders({ symbol: SYMBOL });
-  } catch (_) {
-    // Ignore — no algo open orders is fine
-  }
-}
-
-
-// ─── Bot Engine ──────────────────────────────────────────────────────────────
+// ─── Bot Engine (orchestrator) ───────────────────────────────────────────────
 export const botEngine = {
   state: null as BotState | null,
-  tickSize: 0.1,
+  ladder: null as LadderState | null,
+  tickSize: 0.01,
   stepSize: 0.001,
   minQty: 0.001,
   minNotional: 5,
   initialized: false,
-  // Execution locks to prevent race conditions
-  _placingOrders: false,
-  _placingExits: false,
+  _collectTimer: null as NodeJS.Timeout | null,
+  _lastTickEval: 0,
+  _refreshingExits: false,
+  _partialCloseInFlight: false,
+  _chain: Promise.resolve() as Promise<unknown>,
+
+  get precision(): SymbolPrecision {
+    return {
+      tickSize: this.tickSize,
+      stepSize: this.stepSize,
+      minQty: this.minQty,
+      minNotional: this.minNotional,
+    };
+  },
+
+  get cyclePhase() {
+    return resolveCyclePhase(this.state?.phase ?? 'IDLE', this.ladder);
+  },
+
+  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this._chain.then(fn, fn);
+    this._chain = run.catch((e) => logger.error('Error in exclusive task', { error: e }));
+    return run;
+  },
+
+  buildHost(): BuildPhaseHost & HarvestPhaseHost & ExitPhaseHost {
+    const engine = this;
+    return {
+      get ladder() {
+        return engine.ladder;
+      },
+      set ladder(v: LadderState | null) {
+        engine.ladder = v;
+      },
+      precision: engine.precision,
+      refreshingExits: engine._refreshingExits,
+      setRefreshingExits(v: boolean) {
+        engine._refreshingExits = v;
+      },
+      isPartialCloseInFlight: () => engine._partialCloseInFlight,
+      setPartialCloseInFlight(v: boolean) {
+        engine._partialCloseInFlight = v;
+      },
+      refreshWalls: () => refreshLadderWalls(engine.ladder),
+      refreshExits: () => runRefreshExits(engine.buildHost()),
+      startNextCycle: () => engine.startCycle(),
+    };
+  },
 
   async init() {
-    // Prevent double initialization
     if (this.initialized) {
-      logger.info(`Bot already initialized, skipping.`);
+      logger.info('Bot already initialized, skipping.');
       return;
     }
 
     this.state = await stateManager.getState();
-    logger.info('Bot initializing with state', { state: this.state });
+    logger.info('Bot initializing', {
+      state: this.state,
+      symbol: SYMBOL,
+      leverage: LEVERAGE,
+      cyclePhase: this.cyclePhase,
+      ladderLevels: LADDER_LEVELS,
+      ladderSizeMult: LADDER_SIZE_MULT,
+      accountRiskPercent: ACCOUNT_RISK_PERCENT,
+      tpRewardRatio: TP_REWARD_RATIO,
+      minLadderSpacingPct: MIN_LADDER_SPACING_PCT,
+      maxLadderSpacingPct: MAX_LADDER_SPACING_PCT,
+    });
 
-    // ── Fetch Symbol Info for Precision ────────────────────────────────────
     try {
       const exchangeInfo = await client.getExchangeInfo();
       const symbolInfo = exchangeInfo.symbols.find((s) => s.symbol === SYMBOL);
       if (symbolInfo) {
-        const lotSizeFilter = symbolInfo.filters.find((f) => f.filterType === 'LOT_SIZE') as any;
+        const lotSizeFilter = symbolInfo.filters.find((f) => f.filterType === 'LOT_SIZE') as {
+          stepSize: string;
+          minQty: string;
+        } | undefined;
         if (lotSizeFilter) {
           this.stepSize = parseFloat(lotSizeFilter.stepSize);
           this.minQty = parseFloat(lotSizeFilter.minQty);
         }
-
-        const priceFilter = symbolInfo.filters.find((f) => f.filterType === 'PRICE_FILTER') as any;
+        const priceFilter = symbolInfo.filters.find((f) => f.filterType === 'PRICE_FILTER') as {
+          tickSize: string;
+        } | undefined;
         if (priceFilter) this.tickSize = parseFloat(priceFilter.tickSize);
-
-        const minNotionalFilter = symbolInfo.filters.find((f) => f.filterType === 'MIN_NOTIONAL') as any;
+        const minNotionalFilter = symbolInfo.filters.find((f) => f.filterType === 'MIN_NOTIONAL') as {
+          notional?: string;
+          minNotional?: string;
+        } | undefined;
         if (minNotionalFilter) {
           this.minNotional = parseFloat(minNotionalFilter.notional || minNotionalFilter.minNotional || '5');
         }
-
-        logger.info('Symbol Info', { tickSize: this.tickSize, stepSize: this.stepSize, minQty: this.minQty, minNotional: this.minNotional });
+        logger.info('Symbol Info', this.precision);
       } else {
         logger.error(`Symbol ${SYMBOL} not found in exchange info!`);
       }
@@ -103,21 +160,19 @@ export const botEngine = {
       logger.error('Failed to fetch exchange info', { error: e });
     }
 
-    // ── Set Margin Type to CROSSED ───────────────────────────────────────
     try {
       await client.setMarginType({ symbol: SYMBOL, marginType: 'CROSSED' });
       logger.info(`Margin type set to CROSSED for ${SYMBOL}`);
-    } catch (e: any) {
-      // -4046 = "No need to change margin type" (already CROSSED)
-      const msg = e?.message || e?.body?.msg || '';
-      if (e?.code === -4046 || msg.includes('No need to change margin type')) {
+    } catch (e: unknown) {
+      const err = e as { code?: number; message?: string; body?: { msg?: string } };
+      const msg = err?.message || err?.body?.msg || '';
+      if (err?.code === -4046 || msg.includes('No need to change margin type')) {
         logger.info(`Margin type already CROSSED for ${SYMBOL}`);
       } else {
         logger.error('Error setting margin type', { error: e });
       }
     }
 
-    // ── Set Leverage ──────────────────────────────────────────────────────
     try {
       await client.setLeverage({ symbol: SYMBOL, leverage: LEVERAGE });
       logger.info(`Leverage set to ${LEVERAGE}x for ${SYMBOL}`);
@@ -125,135 +180,349 @@ export const botEngine = {
       logger.error('Error setting leverage', { error: e });
     }
 
-    // ── Sync state with Binance reality ───────────────────────────────────
     await this.syncStateWithBinance();
-
     this.initialized = true;
     logger.info('Bot initialization complete.');
   },
 
+  // ─── Phase: COLLECTING ─────────────────────────────────────────────────────
+  async startCycle() {
+    this.state = await stateManager.getState();
+    this.ladder = null;
+
+    await enterCollectPhase(
+      {
+        onPriceTick: (p) => this.onPriceTick(p),
+        onCollectComplete: () =>
+          this.runExclusive(async () => {
+            const result = await placeStraddleOrders(this.precision);
+            if (!result) {
+              await stateManager.updatePhase('IDLE');
+              setTimeout(
+                () => this.startCycle().catch((e) => logger.error('Error restarting cycle', { error: e })),
+                5_000
+              );
+              return;
+            }
+            this.ladder = result.ladder;
+            await persistLadderState(this.ladder, 'WAITING_ENTRY');
+          }),
+      },
+      this
+    );
+  },
+
+  async persistLadder(phase?: BotPhase) {
+    await persistLadderState(this.ladder, phase);
+  },
+
+  refreshWalls(): boolean {
+    return refreshLadderWalls(this.ladder);
+  },
+
+  // ─── WS handlers ───────────────────────────────────────────────────────────
+  async handleOrderUpdate(data: { order: Record<string, unknown> }) {
+    const order = data.order;
+    if (order.symbol !== SYMBOL) return;
+
+    return this.runExclusive(async () => {
+      this.state = await stateManager.getState();
+      if (!this.state || this.state.status === 'STOPPED') return;
+
+      const ladder = this.ladder;
+      const clientOrderId = order.clientOrderId as string;
+
+      const entry = ladder?.entryOrders.find((o) => o.clientOrderId === clientOrderId);
+      if (entry && ladder) {
+        if (order.orderStatus === 'FILLED') {
+          entry.status = 'FILLED';
+          ladder.fills++;
+
+          const fillPrice = parseFloat((order.averagePrice || order.price || '0') as string);
+          const fillQty = parseFloat(
+            (order.orderFilledAccumulatedQuantity || order.originalQuantity || '0') as string
+          );
+          ladder.feesPaid += fillPrice * fillQty * MAKER_FEE;
+
+          logger.info(`[WS] Entry #${ladder.fills} filled: ${entry.side} ${fillQty} @ ${fillPrice} (phase: ${this.cyclePhase})`);
+
+          const host = this.buildHost();
+
+          for (let attempt = 0; attempt < 5; attempt++) {
+            const pos = await getPosition();
+            if (pos.qty > 0) {
+              ladder.posQty = pos.qty;
+              ladder.entryPrice = pos.entry;
+            }
+            if (attempt === 4 || pos.qty > 0) break;
+            await sleep(200);
+          }
+
+          const { exchangeEntryCount } = await syncLadderWithExchange(ladder);
+
+          const tickPrice = orderBookCollector.currentPrice || fillPrice;
+          const partialDone =
+            ladder.fills >= 2 ? await executePartialClose(host, tickPrice) : false;
+          const isFirstFill = !ladder.side;
+
+          if (!isHarvestMode(ladder, undefined, ladder.posQty, exchangeEntryCount, this.stepSize) && !partialDone) {
+            const placeLadder = () => runPlaceLadderOrders(host);
+            if (isFirstFill) {
+              await handleFirstFill(ladder, entry, fillPrice, placeLadder);
+            } else {
+              await handleSubsequentFill(ladder, entry, placeLadder);
+            }
+            await runRefreshExits(host);
+          } else if (!partialDone) {
+            await runRefreshExits(host);
+          }
+
+          const posFinal = await getPosition();
+          if (posFinal.qty > 0 && posFinal.side) {
+            syncLadderSideFromPosition(ladder, posFinal, 'WS fill');
+          }
+
+          await persistLadderState(ladder, botPhaseForLadder(ladder));
+        } else if (order.orderStatus === 'CANCELED' || order.orderStatus === 'EXPIRED') {
+          entry.status = 'CANCELED';
+          await persistLadderState(ladder);
+        }
+        return;
+      }
+
+      const rp = parseFloat((order.realisedProfit || order.rp || '0') as string);
+      if (rp !== 0 && order.orderStatus === 'FILLED') {
+        logger.info(`[WS] Realized PnL: ${rp}`);
+        await stateManager.updatePhase(this.state.phase, undefined, undefined, rp);
+      }
+
+      if (isInTradePhase(this.state.phase) && order.orderStatus === 'FILLED') {
+        const isExitOrder =
+          order.reduceOnly === true ||
+          order.reduceOnly === 'true' ||
+          order.orderType === 'MARKET' ||
+          order.type === 'MARKET';
+        if (!isExitOrder && rp === 0) return;
+
+        await sleep(300);
+        const pos = await getPosition();
+
+        if (pos.qty === 0) {
+          await runFinalizeCycle(this.buildHost(), parseFloat((order.averagePrice || order.price || '0') as string));
+        } else if (ladder) {
+          ladder.posQty = pos.qty;
+          ladder.entryPrice = pos.entry;
+          await persistLadderState(ladder);
+        }
+      }
+    });
+  },
+
+  async handleAlgoUpdate(data: { algoOrder: Record<string, unknown> }) {
+    const algo = data.algoOrder;
+    if (algo.symbol !== SYMBOL) return;
+
+    logger.info('[WS] Algo Update', {
+      type: algo.orderType,
+      status: algo.algoStatus,
+      algoId: algo.algoId,
+    });
+
+    if (
+      (algo.algoStatus === 'CANCELED' ||
+        algo.algoStatus === 'REJECTED' ||
+        algo.algoStatus === 'EXPIRED') &&
+      !this._refreshingExits &&
+      this.ladder?.slAlgoId === Number(algo.algoId)
+    ) {
+      logger.warn(`[WS] Active SL algo ${algo.algoId} was ${algo.algoStatus}! Re-placing exits...`);
+      this.runExclusive(async () => {
+        const pos = await getPosition();
+        if (pos.qty > 0) await runRefreshExits(this.buildHost());
+        else logger.info('[WS] Position already flat — skip SL re-place after algo cancel');
+      }).catch((e) => logger.error('[WS] Error re-placing exits', { error: e }));
+    }
+
+    if (algo.algoStatus === 'TRIGGERED' || algo.algoStatus === 'FINISHED') {
+      logger.info(`[WS] SL algo ${algo.algoStatus}, waiting for MARKET fill...`);
+    }
+  },
+
+  // ─── Phase: HARVESTING (partial close on ticks) ────────────────────────────
+  onPriceTick(price: number) {
+    const now = Date.now();
+    if (now - this._lastTickEval < 5_000) return;
+    this._lastTickEval = now;
+
+    if (!canEvaluatePartialClose(this.ladder)) return;
+
+    this.runExclusive(async () => {
+      const changed = await executePartialClose(this.buildHost(), price);
+      if (changed) await persistLadderState(this.ladder);
+    }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
+  },
+
+  // ─── Phase: BUILDING ───────────────────────────────────────────────────────
+  async placeLadderOrders() {
+    await runPlaceLadderOrders(this.buildHost());
+  },
+
+  async refreshExits() {
+    await runRefreshExits(this.buildHost());
+  },
+
+  async maybePartialClose(price: number): Promise<boolean> {
+    return executePartialClose(this.buildHost(), price);
+  },
+
+  async finalizeCycle(exitPrice: number) {
+    await runFinalizeCycle(this.buildHost(), exitPrice);
+  },
+
+  // ─── Sync ──────────────────────────────────────────────────────────────────
   async syncStateWithBinance() {
     logger.info('Syncing state with Binance...');
     try {
-      const accInfo = await client.getAccountInformationV3();
-      const position = accInfo.positions.find((p) => p.symbol === SYMBOL);
-      const openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-      const posAmt = position ? parseFloat(position.positionAmt as string) : 0;
+      this.state = await stateManager.getState();
 
-      // Also check algo orders (SL is now an algo order since Dec 2025)
-      let openAlgoOrders: any[] = [];
-      try {
-        openAlgoOrders = await client.getOpenAlgoOrders({ symbol: SYMBOL });
-      } catch (_) {
-        // Ignore — might fail if no algo orders exist
+      if (!this.ladder && this.state.orders?.ladder?.baseQty) {
+        this.ladder = this.state.orders.ladder as LadderState;
+        logger.info('Restored ladder state from DB', {
+          fills: this.ladder.fills,
+          side: this.ladder.side,
+          phase: resolveCyclePhase(this.state.phase, this.ladder),
+        });
       }
 
-      this.state = await stateManager.getState();
-      const trackedOrders = this.state.orders || {};
+      let openOrders: { clientOrderId?: string; reduceOnly?: boolean; type?: string }[] = [];
+      try {
+        openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
+      } catch { /* none is fine */ }
 
-      if (posAmt !== 0) {
-        // ── We have an open position ──────────────────────────────────────
-        logger.info(`[Sync] In Position: ${posAmt}`);
+      const pos = await getPosition();
 
-        if (this.state.phase !== 'IN_POSITION') {
-          await stateManager.updatePhase('IN_POSITION');
+      if (pos.qty > 0) {
+        logger.info(`[Sync] In position: ${pos.side} ${pos.qty} @ ${pos.entry}`);
+        orderBookCollector.onPrice = (p) => this.onPriceTick(p);
+        await orderBookCollector.ensureDepthCollection(SYMBOL);
+
+        const openEntryCount = countExchangeEntryOrders(openOrders);
+        const { exchangeEntryCount } = this.ladder
+          ? await syncLadderWithExchange(this.ladder)
+          : { exchangeEntryCount: openEntryCount };
+
+        let repairedHarvest = false;
+        if (!this.ladder) {
+          const balance = await getAccountBalance();
+          this.ladder = {
+            baseQty: pos.qty,
+            riskAmount: balance * ACCOUNT_RISK_PERCENT,
+            buyWalls: [],
+            sellWalls: [],
+            usedWalls: [],
+            side: pos.side,
+            entryOrders: [],
+            fills: 1,
+            partialCloses: 0,
+            feesPaid: pos.qty * pos.entry * MAKER_FEE,
+            entryPrice: pos.entry,
+            posQty: pos.qty,
+            slAlgoId: null,
+            tpClientOrderId: null,
+            windingDown: true,
+            ladderStep: 1,
+          };
+          logger.warn('[Sync] Position without ladder state — minimal HARVESTING ladder reconstructed.');
+        } else {
+          this.ladder.posQty = pos.qty;
+          this.ladder.entryPrice = pos.entry;
+          this.ladder.side = pos.side;
+          repairedHarvest = repairHarvestState(this.ladder, pos.qty, exchangeEntryCount, this.stepSize);
+          if (repairedHarvest) {
+            logger.warn(
+              `[Sync] Repaired harvest state (pos ${pos.qty}, open entries ${openEntryCount}, was ${this.state.phase})`
+            );
+          }
         }
 
-        // Check if we have exit orders placed
-        const hasTP = openOrders.some(o => o.type === 'LIMIT' && o.reduceOnly);
-        // SL is now an algo order (STOP_MARKET via Algo API)
-        // Only count active algo orders (NEW, PENDING, TRIGGERING), not CANCELED or FINISHED
-        const hasSL = openAlgoOrders.some((o: any) => 
-          o.orderType === 'STOP_MARKET' && 
-          (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')
+        const syncPhase: BotPhase = isHarvestMode(
+          this.ladder,
+          this.state.phase,
+          pos.qty,
+          exchangeEntryCount,
+          this.stepSize
+        )
+          ? 'HARVESTING'
+          : 'BUILDING';
+        if (this.state.phase !== syncPhase) {
+          await stateManager.updatePhase(
+            syncPhase,
+            this.state.cycle_id || randomUUID(),
+            undefined,
+            undefined,
+            pos.entry,
+            pos.side
+          );
+        }
+
+        let hasSL = false;
+        try {
+          const algoOrders = await client.getOpenAlgoOrders({ symbol: SYMBOL });
+          hasSL = algoOrders.some(
+            (o: { orderType: string; algoStatus: string }) =>
+              o.orderType === 'STOP_MARKET' &&
+              (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')
+          );
+        } catch { /* none is fine */ }
+
+        const hasTP = openOrders.some((o) => o.reduceOnly && o.type === 'LIMIT');
+
+        // Stale TP id in memory if user canceled manually on exchange
+        if (this.ladder.tpClientOrderId && !hasTP) {
+          this.ladder.tpClientOrderId = null;
+        }
+
+        if (
+          syncPhase === 'BUILDING' &&
+          needsLadderPlacement(this.ladder, exchangeEntryCount)
+        ) {
+          if (this.ladder.ladderSizingBlocked) {
+            logger.warn('[Sync] Clearing ladderSizingBlocked — retrying with geometric sizing');
+            this.ladder.ladderSizingBlocked = false;
+          }
+          for (let i = 0; i < 30 && !orderBookCollector.isSynced; i++) {
+            await sleep(200);
+          }
+          logger.warn('[Sync] No ladder entry orders on exchange — attempting placement');
+          await this.runExclusive(() => runPlaceLadderOrders(this.buildHost()));
+        }
+
+        if (!hasSL || !hasTP || repairedHarvest || this.state.phase !== syncPhase) {
+          if (repairedHarvest && hasSL && hasTP) {
+            logger.warn('[Sync] Harvest state repaired — re-placing exits at harvest % (was building SL)');
+          } else if (this.state.phase !== syncPhase) {
+            logger.warn(`[Sync] Phase mismatch (${this.state.phase} → ${syncPhase}). Re-placing exits...`);
+          } else {
+            logger.warn(`[Sync] Missing exits (SL: ${hasSL}, TP: ${hasTP}). Re-placing...`);
+          }
+          await this.runExclusive(() => runRefreshExits(this.buildHost()));
+        }
+        await persistLadderState(this.ladder, botPhaseForLadder(this.ladder));
+      } else {
+        const entryOrdersOpen = this.ladder?.entryOrders.some(
+          (o) => o.status === 'OPEN' && o.clientOrderId && isOpenOnExchange(o, openOrders)
         );
 
-        if (!hasTP || !hasSL) {
-          logger.warn(`[Sync] Missing exit orders (TP: ${hasTP}, SL: ${hasSL}). Attempting to reconstruct...`);
-
-          // Don't reconstruct if we're already placing exits (prevents loops)
-          if (this._placingExits) {
-            logger.warn('[Sync] Already placing exits, skipping reconstruction to prevent loop');
-            return;
-          }
-
-          // Use getPositionsV3 for reliable entryPrice (getAccountInformationV3 may omit it)
-          let entryPrice = 0;
-          const absQty = Math.abs(posAmt);
-          const side = posAmt > 0 ? 'LONG' : 'SHORT';
-
-          try {
-            const positionsV3 = await client.getPositionsV3({ symbol: SYMBOL });
-            const posV3 = positionsV3.find((p) => parseFloat(p.positionAmt as string) !== 0);
-            if (posV3) {
-              entryPrice = parseFloat(posV3.entryPrice as string) || 0;
-            }
-          } catch (e) {
-            logger.error('[Sync] Failed to fetch positionsV3', { error: e });
-          }
-
-          if (entryPrice > 0 && absQty > 0) {
-            // Only cancel if we're missing BOTH orders AND not already placing exits
-            if (!hasTP && !hasSL && !this._placingExits) {
-              // Cancel any stale orders first
-              await cancelAllOrders();
-              await new Promise(resolve => setTimeout(resolve, 500));
-            }
-
-            // Only place exits if not already placing
-            if (!this._placingExits) {
-              await this.placeExits(side as 'LONG' | 'SHORT', entryPrice, absQty);
-              logger.info(`[Sync] Reconstructed exit orders for ${side} @ ${entryPrice}`);
-            } else {
-              logger.warn('[Sync] Already placing exits, skipping reconstruction');
-            }
-          } else {
-            logger.warn(`[Sync] Cannot reconstruct exits: entryPrice=${entryPrice}, qty=${absQty}. Manual check required.`);
-          }
-        }
-
-      } else {
-        // ── No position ───────────────────────────────────────────────────
-        if (openOrders.length > 0 || openAlgoOrders.length > 0) {
-          const entries = openOrders.filter(o => o.type === 'LIMIT' && !o.reduceOnly);
-
-          if (entries.length > 0) {
-            logger.info(`[Sync] Waiting for Entry. Open entry orders: ${entries.length}`);
-            if (this.state.phase !== 'WAITING_ENTRY') {
-              const longEntry = entries.find(o => o.side === 'BUY');
-              const shortEntry = entries.find(o => o.side === 'SELL');
-              await stateManager.updatePhase('WAITING_ENTRY', this.state.cycle_id || randomUUID(), {
-                longOrderId: longEntry?.orderId || trackedOrders.longOrderId,
-                shortOrderId: shortEntry?.orderId || trackedOrders.shortOrderId
-              });
-            }
-          } else {
-            // Only exit orders remain but no position — clean up
-            logger.info('[Sync] No position but exit/algo orders remain. Cleaning up.');
-            await cancelAllOrders();
-            await stateManager.updatePhase('IDLE');
-          }
+        if (this.state.phase === 'WAITING_ENTRY' && entryOrdersOpen) {
+          logger.info('[Sync] STRADDLE phase — waiting for first entry fill.');
+          orderBookCollector.onPrice = (p) => this.onPriceTick(p);
+          await orderBookCollector.ensureDepthCollection(SYMBOL);
+        } else if (this.state.status === 'RUNNING') {
+          logger.info('[Sync] No position. Starting fresh COLLECTING phase.');
+          await this.startCycle();
         } else {
-          logger.info('[Sync] Idle.');
-          if (this.state.phase !== 'IDLE') {
-            await stateManager.updatePhase('IDLE');
-          }
-          
-          // Start new cycle if bot is RUNNING, IDLE, and no orders exist
-          // Only trigger if not already placing orders (lock check prevents duplicates)
-          if (this.state.status === 'RUNNING' && !this._placingOrders) {
-            // Double-check no orders exist before starting
-            const hasOrders = openOrders.length > 0 || openAlgoOrders.length > 0;
-            if (!hasOrders) {
-              logger.info('[Sync] No orders found, starting new cycle...');
-              // Use setTimeout to avoid blocking sync and allow state to settle
-              setTimeout(() => {
-                this.handleIdle().catch((e) =>
-                  logger.error('[Sync] Error starting cycle from sync', { error: e })
-                );
-              }, 500);
-            }
-          }
+          if (this.state.phase !== 'IDLE') await stateManager.updatePhase('IDLE');
+          logger.info('[Sync] IDLE (stopped).');
         }
       }
 
@@ -263,541 +532,14 @@ export const botEngine = {
     }
   },
 
-
-  async handleOrderUpdate(data: any) {
-    const order = data.order;
-    logger.info('[WS] Order Update', { symbol: order.symbol, status: order.orderStatus, side: order.side, orderId: order.orderId, type: order.orderType });
-
-    if (order.symbol !== SYMBOL) return;
-
-    // Reload state to ensure we have the latest
-    this.state = await stateManager.getState();
-    if (!this.state || this.state.status === 'STOPPED') return;
-
-    const tracked = this.state.orders || {};
-
-    // ── 1. Handle Entry Order Fill ──────────────────────────────────────────
-    const isLongEntry = order.orderId == tracked.longOrderId;
-    const isShortEntry = order.orderId == tracked.shortOrderId;
-
-    if (isLongEntry || isShortEntry) {
-      if (order.orderStatus === 'FILLED') {
-        const side: 'LONG' | 'SHORT' = isLongEntry ? 'LONG' : 'SHORT';
-        const otherOrderId = isLongEntry ? tracked.shortOrderId : tracked.longOrderId;
-
-        // Use WS data directly — no extra API call needed
-        const entryPrice = parseFloat(order.averagePrice || order.price || '0');
-        const filledQty = parseFloat(order.orderFilledAccumulatedQuantity || order.originalQuantity || '0');
-
-        logger.info(`[WS] ${side} Entry Filled @ ${entryPrice} (Qty: ${filledQty})`);
-
-        // Cancel the opposite straddle order
-        // First check if the order exists, then cancel it
-        try {
-          // Check if the order is still open before trying to cancel
-          const openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-          const oppositeOrder = openOrders.find((o: any) => o.orderId === otherOrderId);
-          
-          if (oppositeOrder) {
-            // Order exists, cancel it
-            await client.cancelOrder({ symbol: SYMBOL, orderId: otherOrderId });
-            logger.info(`[WS] Canceled opposite order: ${otherOrderId}`);
-          } else {
-            // Order doesn't exist in open orders - might have been filled/canceled already
-            logger.info(`[WS] Opposite order ${otherOrderId} not found in open orders (likely already filled/canceled)`);
-            
-            // As a safety measure, cancel all non-reduceOnly LIMIT orders (entry orders)
-            // This ensures we clean up any remaining entry orders
-            const entryOrders = openOrders.filter((o: any) => 
-              o.type === 'LIMIT' && !o.reduceOnly && o.orderId !== order.orderId
-            );
-            if (entryOrders.length > 0) {
-              logger.info(`[WS] Canceling ${entryOrders.length} remaining entry order(s) as safety measure`);
-              for (const entryOrder of entryOrders) {
-                try {
-                  await client.cancelOrder({ symbol: SYMBOL, orderId: entryOrder.orderId });
-                  logger.info(`[WS] Canceled entry order: ${entryOrder.orderId}`);
-                } catch (cancelErr: any) {
-                  logger.warn(`[WS] Could not cancel entry order ${entryOrder.orderId}`, { error: cancelErr?.message || cancelErr });
-                }
-              }
-            }
-          }
-        } catch (e: any) {
-          logger.error(`[WS] Error canceling opposite order ${otherOrderId}`, { error: e?.message || e });
-          // Fallback: try to cancel all entry orders
-          try {
-            const openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-            const entryOrders = openOrders.filter((o: any) => 
-              o.type === 'LIMIT' && !o.reduceOnly && o.orderId !== order.orderId
-            );
-            if (entryOrders.length > 0) {
-              logger.info(`[WS] Fallback: Canceling ${entryOrders.length} entry order(s)`);
-              await client.cancelAllOpenOrders({ symbol: SYMBOL });
-            }
-          } catch (fallbackErr: any) {
-            logger.error('[WS] Fallback cancellation also failed', { error: fallbackErr?.message || fallbackErr });
-          }
-        }
-
-        // Update phase to IN_POSITION first to prevent duplicate exit placement
-        if (this.state.phase !== 'IN_POSITION') {
-          await stateManager.updatePhase('IN_POSITION', undefined, undefined, undefined, entryPrice, side);
-          // Reload state after update
-          this.state = await stateManager.getState();
-        }
-
-        // Place TP/SL immediately using WS data (faster than re-fetching from API)
-        // Only place if we're actually in position (state check prevents duplicates)
-        if (this.state.phase === 'IN_POSITION') {
-          await this.placeExits(side, entryPrice, filledQty);
-        } else {
-          logger.warn('[WS] Phase changed before placing exits, skipping to avoid duplicates');
-        }
-
-      } else if (order.orderStatus === 'CANCELED' || order.orderStatus === 'EXPIRED') {
-        logger.info(`[WS] Tracked entry ${order.orderId} was ${order.orderStatus}`);
-        // Don't sync immediately if we're placing exits - wait a bit to avoid race conditions
-        if (!this._placingExits) {
-          setTimeout(() => {
-            this.syncStateWithBinance().catch((e) =>
-              logger.error('[WS] Error syncing after entry cancel', { error: e })
-            );
-          }, 1000);
-        } else {
-          logger.info('[WS] Entry canceled but exits are being placed, skipping sync to avoid race condition');
-        }
-      }
-      return;
-    }
-
-    // ── 2. Accumulate Realized PnL ──────────────────────────────────────────
-    const rp = parseFloat(order.realisedProfit || order.rp || '0');
-    if (rp !== 0) {
-      logger.info(`[WS] Accumulating PnL: ${rp}`);
-      await stateManager.updatePhase(this.state.phase, undefined, undefined, rp);
-      if (this.state) this.state.current_pnl = (this.state.current_pnl || 0) + rp;
-    }
-
-    // ── 3. Handle Exit Order Fill ───────────────────────────────────────────
-    // When SL (algo) triggers, Binance creates a regular MARKET order that
-    // arrives here as ORDER_TRADE_UPDATE with FILLED status + realisedProfit.
-    // When TP (limit) fills, it also arrives here.
-    // Check if we're in position and this order closes it
-    if (this.state.phase === 'IN_POSITION' && order.orderStatus === 'FILLED') {
-      // Check if this is an exit order (reduce-only or MARKET type from SL)
-      // MARKET orders from SL algo don't always have reduceOnly flag, but they close positions
-      const isExitOrder = order.reduceOnly === true || order.reduceOnly === 'true' || order.type === 'MARKET';
-      
-      // Also check if this order has realized profit (indicates it closed a position)
-      const hasRealizedProfit = parseFloat(order.realisedProfit || order.rp || '0') !== 0;
-      
-      if (!isExitOrder && !hasRealizedProfit) {
-        return; // Not an exit order, ignore
-      }
-
-      // Always check position to see if it's closed
-      // Add a small delay to allow Binance to update position after order fill
-      await new Promise(resolve => setTimeout(resolve, 200));
-      
-      const accInfo = await client.getAccountInformationV3();
-      const position = accInfo.positions.find((p) => p.symbol === SYMBOL);
-      const posAmt = position ? parseFloat(position.positionAmt as string) : 0;
-
-      if (posAmt === 0) {
-        logger.info('[WS] Position closed.');
-
-        const finalPnl = this.state.current_pnl || 0;
-        if (this.state.cycle_id) {
-          await stateManager.saveTrade({
-            cycle_id: this.state.cycle_id,
-            symbol: SYMBOL,
-            side: this.state.active_side || 'BOTH',
-            entry_price: this.state.entry_price || 0,
-            exit_price: parseFloat(order.averagePrice || order.price || '0'),
-            pnl: finalPnl,
-            realized_pnl: finalPnl
-          });
-        }
-
-        // Clean up remaining orders — must cancel BOTH regular and algo orders
-        // (if TP hit, SL algo order is still open; if SL hit, TP limit is still open)
-        await cancelAllOrders();
-        logger.info('[WS] Cleaned up remaining exit orders.');
-
-        // Reset to IDLE for next cycle
-        await stateManager.updatePhase('IDLE');
-
-        // Immediately start the next cycle instead of waiting for the loop timer
-        // Use a small delay to ensure state is fully updated and avoid race conditions
-        logger.info('[WS] Starting next cycle after 1.5s...');
-        setTimeout(() => {
-          this.handleIdle().catch((e) =>
-            logger.error('Error starting next cycle', { error: e })
-          );
-        }, 1500)
-      }
+  async stop() {
+    stopCollectTimer(this);
+    orderBookCollector.stopAll();
+    const pos = await getPosition().catch(() => ({ qty: 0, entry: 0, side: null }));
+    if (pos.qty > 0) {
+      logger.warn(
+        `Bot stopped with OPEN POSITION (${pos.side} ${pos.qty}). Orders canceled — manage manually!`
+      );
     }
   },
-
-  /**
-   * Handle ALGO_UPDATE WebSocket events (for SL / conditional order status changes).
-   * When the SL algo triggers, the actual fill comes via ORDER_TRADE_UPDATE for the
-   * resulting market order. This handler is mainly for logging and edge-case recovery.
-   */
-  async handleAlgoUpdate(data: any) {
-    const algo = data.algoOrder;
-    logger.info('[WS] Algo Update', { symbol: algo.symbol, type: algo.orderType, status: algo.algoStatus, algoId: algo.algoId });
-
-    if (algo.symbol !== SYMBOL) return;
-
-    // If the algo order was unexpectedly canceled/rejected while in position, trigger a sync
-    // BUT only if we're not already placing exits (prevents loops)
-    if (algo.algoStatus === 'CANCELED' || algo.algoStatus === 'REJECTED' || algo.algoStatus === 'EXPIRED') {
-      this.state = await stateManager.getState();
-      if (this.state?.phase === 'IN_POSITION' && !this._placingExits) {
-        logger.warn(`[WS] SL algo order ${algo.algoStatus} while in position! Syncing state...`);
-        // Add a small delay to avoid immediate re-trigger
-        setTimeout(async () => {
-          const currentState = await stateManager.getState();
-          if (currentState.phase === 'IN_POSITION' && !this._placingExits) {
-            await this.syncStateWithBinance();
-          }
-        }, 1000);
-      }
-    }
-    
-    // When SL algo triggers (TRIGGERED/FINISHED), the actual fill comes via ORDER_TRADE_UPDATE
-    // Just log it, don't do anything else - the position close will be handled by handleOrderUpdate
-    if (algo.algoStatus === 'TRIGGERED' || algo.algoStatus === 'FINISHED') {
-      logger.info(`[WS] SL algo order ${algo.algoStatus}, waiting for MARKET order fill...`);
-    }
-  },
-
-  async handleIdle() {
-    // Prevent concurrent execution
-    if (this._placingOrders) {
-      logger.warn('handleIdle already in progress, skipping duplicate call');
-      return;
-    }
-
-    // Check state before proceeding
-    this.state = await stateManager.getState();
-    if (this.state.phase !== 'IDLE' || this.state.status === 'STOPPED') {
-      logger.info('Not in IDLE phase or bot is stopped, skipping handleIdle', { phase: this.state.phase, status: this.state.status });
-      return;
-    }
-
-    // Check for existing orders before placing new ones
-    try {
-      const existingOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-      if (existingOrders.length > 0) {
-        logger.warn(`Found ${existingOrders.length} existing orders, canceling before placing new ones`);
-        await cancelAllOrders();
-        // Wait a bit for cancellation to complete
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    } catch (e) {
-      logger.error('Error checking existing orders', { error: e });
-    }
-
-    this._placingOrders = true;
-    logger.info('Phase: IDLE. Starting new cycle...');
-    try {
-      // ── Cancel any stale orders from a previous cycle ───────────────────
-      await cancelAllOrders();
-
-      // ── Get current price ───────────────────────────────────────────────
-      const priceRes = await client.getMarkPrice({ symbol: SYMBOL });
-      const currentPrice = parseFloat(priceRes.markPrice as string);
-
-      if (currentPrice <= 0) {
-        logger.error(`Invalid mark price: ${currentPrice}. Skipping cycle.`);
-        return;
-      }
-
-      const longEntryPrice = roundStep(currentPrice * (1 - ENTRY_OFFSET), this.tickSize);
-      const shortEntryPrice = roundStep(currentPrice * (1 + ENTRY_OFFSET), this.tickSize);
-
-      // ── Calculate position size from risk ───────────────────────────────
-      const balance = await getAccountBalance();
-
-      if (balance <= 0) {
-        logger.error(`No available balance ($${balance}). Skipping cycle.`);
-        return;
-      }
-
-      // Risk = 1% of balance, with buffer for fees/slippage
-      const riskAmount = balance * RISK_PER_TRADE * RISK_BUFFER;
-
-      let longQty = riskAmount / (longEntryPrice * STOP_LOSS_PERCENT);
-      let shortQty = riskAmount / (shortEntryPrice * STOP_LOSS_PERCENT);
-
-      longQty = floorStep(longQty, this.stepSize);
-      shortQty = floorStep(shortQty, this.stepSize);
-
-      // ── Validate quantities ─────────────────────────────────────────────
-      if (longQty < this.minQty || shortQty < this.minQty) {
-        logger.error(`Quantity below minimum (${this.minQty}). Long: ${longQty}, Short: ${shortQty}. Need more balance.`);
-        return;
-      }
-
-      const longNotional = longQty * longEntryPrice;
-      const shortNotional = shortQty * shortEntryPrice;
-
-      if (longNotional < this.minNotional || shortNotional < this.minNotional) {
-        logger.error(`Notional below minimum ($${this.minNotional}). Long: $${longNotional.toFixed(2)}, Short: $${shortNotional.toFixed(2)}. Need more balance.`);
-        return;
-      }
-
-      logger.info('Placing straddle orders', {
-        balance: balance.toFixed(2),
-        risk: riskAmount.toFixed(2),
-        riskPercent: (RISK_PER_TRADE * 100).toFixed(1),
-        riskBuffer: RISK_BUFFER,
-        longEntry: longEntryPrice,
-        longQty: longQty,
-        longNotional: longNotional.toFixed(2),
-        shortEntry: shortEntryPrice,
-        shortQty: shortQty,
-        shortNotional: shortNotional.toFixed(2)
-      });
-
-      // ── Place both entry orders ─────────────────────────────────────────
-      const longOrderParams: NewFuturesOrderParams = {
-        symbol: SYMBOL,
-        side: 'BUY',
-        type: 'LIMIT',
-        price: longEntryPrice,
-        quantity: longQty,
-        timeInForce: 'GTC'
-      };
-
-      const shortOrderParams: NewFuturesOrderParams = {
-        symbol: SYMBOL,
-        side: 'SELL',
-        type: 'LIMIT',
-        price: shortEntryPrice,
-        quantity: shortQty,
-        timeInForce: 'GTC'
-      };
-
-      const longOrder = await client.submitNewOrder(longOrderParams);
-      const shortOrder = await client.submitNewOrder(shortOrderParams);
-
-      const cycleId = randomUUID();
-      await stateManager.updatePhase('WAITING_ENTRY', cycleId, {
-        longOrderId: longOrder.orderId,
-        shortOrderId: shortOrder.orderId
-      });
-
-      logger.info('Straddle placed', { cycleId, longOrderId: longOrder.orderId, shortOrderId: shortOrder.orderId });
-
-    } catch (error) {
-      logger.error('Error in handleIdle', { error });
-    } finally {
-      this._placingOrders = false;
-    }
-  },
-
-  /**
-   * Place Take-Profit and Stop-Loss exit orders.
-   * - TP: regular LIMIT order (via submitNewOrder)
-   * - SL: STOP_MARKET via Algo Order API (required since Binance Dec 2025 migration)
-   */
-  async placeExits(side: 'LONG' | 'SHORT', entryPrice: number, quantity: number) {
-    // Prevent concurrent execution - SET LOCK FIRST
-    if (this._placingExits) {
-      logger.warn('placeExits already in progress, skipping duplicate call', { side, entryPrice, quantity });
-      return;
-    }
-    
-    // Set lock immediately to prevent race conditions
-    this._placingExits = true;
-
-    logger.info(`Placing exits for ${side} @ ${entryPrice} (Qty: ${quantity})`);
-
-    if (entryPrice <= 0 || quantity <= 0) {
-      logger.error(`Invalid exit params: entryPrice=${entryPrice}, quantity=${quantity}. Cannot place exits.`);
-      this._placingExits = false;
-      return;
-    }
-
-    // Check for existing exit orders before placing new ones
-    try {
-      const openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-      const openAlgoOrders = await client.getOpenAlgoOrders({ symbol: SYMBOL });
-      
-      const hasTP = openOrders.some(o => o.type === 'LIMIT' && o.reduceOnly);
-      const hasSL = openAlgoOrders.some((o: any) => 
-        o.orderType === 'STOP_MARKET' && 
-        (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')
-      );
-      
-      if (hasTP && hasSL) {
-        logger.warn('Exit orders already exist, skipping duplicate placement', { hasTP, hasSL, tpCount: openOrders.filter(o => o.type === 'LIMIT' && o.reduceOnly).length, slCount: openAlgoOrders.filter((o: any) => o.orderType === 'STOP_MARKET' && (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')).length });
-        this._placingExits = false;
-        return;
-      }
-      
-      // If only one exists, just place the missing one (don't cancel the existing one)
-      if (hasTP && !hasSL) {
-        logger.info('TP exists but SL missing, will place SL only', { hasTP, hasSL });
-      } else if (!hasTP && hasSL) {
-        logger.info('SL exists but TP missing, will place TP only', { hasTP, hasSL });
-      }
-    } catch (e) {
-      logger.error('Error checking existing exit orders', { error: e });
-      this._placingExits = false;
-      return;
-    }
-
-    // Verify we actually have a position before placing reduce-only orders
-    let exitQty = quantity;
-    try {
-      const accInfo = await client.getAccountInformationV3();
-      const position = accInfo.positions.find((p) => p.symbol === SYMBOL);
-      const posAmt = position ? parseFloat(position.positionAmt as string) : 0;
-
-      if (posAmt === 0) {
-        logger.warn('Cannot place exit orders: No open position found', { side, entryPrice, quantity });
-        this._placingExits = false;
-        return;
-      }
-
-      // Verify position side matches
-      const actualSide = posAmt > 0 ? 'LONG' : 'SHORT';
-      if (actualSide !== side) {
-        logger.warn('Position side mismatch', { expected: side, actual: actualSide, posAmt });
-        this._placingExits = false;
-        return;
-      }
-
-      // Use actual position size (may differ slightly due to partial fills)
-      const actualQty = Math.abs(posAmt);
-      if (actualQty < this.minQty) {
-        logger.warn('Position size too small for exit orders', { actualQty, minQty: this.minQty });
-        this._placingExits = false;
-        return;
-      }
-
-      // Use the smaller of requested quantity or actual position size
-      exitQty = Math.min(quantity, actualQty);
-      logger.info('Verified position before placing exits', { side, posAmt, requestedQty: quantity, exitQty });
-
-    } catch (e) {
-      logger.error('Error verifying position before placing exits', { error: e });
-      this._placingExits = false;
-      return;
-    }
-    
-    // Double-check for existing orders AFTER position verification (orders might have been placed by another thread)
-    try {
-      const openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-      const openAlgoOrders = await client.getOpenAlgoOrders({ symbol: SYMBOL });
-      
-      const hasTP = openOrders.some(o => o.type === 'LIMIT' && o.reduceOnly);
-      const hasSL = openAlgoOrders.some((o: any) => 
-        o.orderType === 'STOP_MARKET' && 
-        (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')
-      );
-      
-      if (hasTP && hasSL) {
-        logger.warn('Exit orders appeared while verifying position, skipping placement', { hasTP, hasSL });
-        this._placingExits = false;
-        return;
-      }
-    } catch (e) {
-      logger.error('Error in final order check', { error: e });
-      // Continue anyway - better to place than miss
-    }
-
-    const closeSide = side === 'LONG' ? 'SELL' : 'BUY';
-
-    const tpPrice = side === 'LONG'
-      ? roundStep(entryPrice * (1 + TAKE_PROFIT_PERCENT), this.tickSize)
-      : roundStep(entryPrice * (1 - TAKE_PROFIT_PERCENT), this.tickSize);
-
-    const slPrice = side === 'LONG'
-      ? roundStep(entryPrice * (1 - STOP_LOSS_PERCENT), this.tickSize)
-      : roundStep(entryPrice * (1 + STOP_LOSS_PERCENT), this.tickSize);
-
-    // ── Place Take-Profit (regular LIMIT order) ───────────────────────────
-    // Check if TP already exists before placing
-    try {
-      const openOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-      const tpOrders = openOrders.filter(o => o.type === 'LIMIT' && o.reduceOnly);
-      const hasTP = tpOrders.length > 0;
-      
-      if (!hasTP) {
-        await client.submitNewOrder({
-          symbol: SYMBOL,
-          side: closeSide,
-          type: 'LIMIT',
-          price: tpPrice,
-          quantity: exitQty,
-          timeInForce: 'GTC',
-          reduceOnly: 'true'
-        });
-        logger.info(`TP placed: ${closeSide} LIMIT @ ${tpPrice} (Qty: ${exitQty})`);
-      } else {
-        logger.warn(`TP order already exists (${tpOrders.length} found), skipping placement`, { existingTPs: tpOrders.map(o => ({ orderId: o.orderId, price: o.price })) });
-      }
-    } catch (e: any) {
-      logger.error('FAILED to place TP order', { error: e?.message || e, side, tpPrice, quantity: exitQty });
-    }
-
-    // ── Place Stop-Loss (Algo Order API — STOP_MARKET) ────────────────────
-    // Check if SL already exists before placing
-    try {
-      const openAlgoOrders = await client.getOpenAlgoOrders({ symbol: SYMBOL });
-      const slOrders = openAlgoOrders.filter((o: any) => 
-        o.orderType === 'STOP_MARKET' && 
-        (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')
-      );
-      const hasSL = slOrders.length > 0;
-      
-      if (!hasSL) {
-        const algoRes = await client.submitNewAlgoOrder({
-          algoType: 'CONDITIONAL',
-          symbol: SYMBOL,
-          side: closeSide,
-          type: 'STOP_MARKET',
-          quantity: exitQty,
-          triggerPrice: slPrice,
-          reduceOnly: 'true',
-        });
-        logger.info(`SL placed: ${closeSide} STOP_MARKET (algo) @ ${slPrice} (Qty: ${exitQty})`, { algoId: algoRes.algoId });
-      } else {
-        logger.warn(`SL algo order already exists (${slOrders.length} found), skipping placement`, { existingSLs: slOrders.map((o: any) => ({ algoId: o.algoId, triggerPrice: o.triggerPrice, status: o.algoStatus })) });
-      }
-    } catch (e: any) {
-      logger.error('FAILED to place SL algo order', { error: e?.message || e });
-    } finally {
-      this._placingExits = false;
-      
-      // Final verification: log all exit orders after placement
-      try {
-        const finalOrders = await client.getAllOpenOrders({ symbol: SYMBOL });
-        const finalAlgoOrders = await client.getOpenAlgoOrders({ symbol: SYMBOL });
-        const finalTPs = finalOrders.filter(o => o.type === 'LIMIT' && o.reduceOnly);
-        const finalSLs = finalAlgoOrders.filter((o: any) => 
-          o.orderType === 'STOP_MARKET' && 
-          (o.algoStatus === 'NEW' || o.algoStatus === 'PENDING' || o.algoStatus === 'TRIGGERING')
-        );
-        logger.info('Final exit order count after placement', { tpCount: finalTPs.length, slCount: finalSLs.length, totalExitOrders: finalTPs.length + finalSLs.length });
-        
-        if (finalTPs.length > 1 || finalSLs.length > 1) {
-          logger.error('DUPLICATE EXIT ORDERS DETECTED!', { 
-            tpCount: finalTPs.length, 
-            slCount: finalSLs.length,
-            tpOrders: finalTPs.map(o => ({ orderId: o.orderId, price: o.price })),
-            slOrders: finalSLs.map((o: any) => ({ algoId: o.algoId, triggerPrice: o.triggerPrice }))
-          });
-        }
-      } catch (e) {
-        logger.error('Error in final order verification', { error: e });
-      }
-    }
-  }
 };
