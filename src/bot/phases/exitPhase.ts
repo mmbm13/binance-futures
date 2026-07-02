@@ -1,14 +1,14 @@
-import { SYMBOL, LADDER_LEVELS, TP_REWARD_RATIO } from '../config';
+import { SYMBOL, CATASTROPHIC_SL_MULT, TP_REWARD_RATIO } from '../config';
 import { client } from '../client';
 import { cancelAllOrders, cancelByClientOrderId, getPosition, syncLadderWithExchange, syncLadderSideFromPosition } from '../exchange';
 import { formatError } from '../errors';
 import { orderBookCollector } from '../orderbook';
 import { stateManager } from '../state';
-import { LadderState, SymbolPrecision } from '../types';
+import { LadderState, PositionSnapshot, SymbolPrecision } from '../types';
 import { countFilledOnSide, countOpenOnSide, effectiveLadderLevels } from '../ladder/coverage';
 import { activeEntrySide } from '../ladder/spacing';
 import { buildExitPriceOptions } from './exitPricingContext';
-import { computeExitPrices } from './exitPricing';
+import { computeCatastrophicSlPrice, computeExitPrices, wouldSlTriggerNow } from './exitPricing';
 import { isHarvestMode, repairHarvestState } from './harvestMode';
 import { botPhaseForLadder } from './types';
 import { logger } from '../../utils/logger';
@@ -19,6 +19,72 @@ export interface ExitPhaseHost {
   refreshingExits: boolean;
   setRefreshingExits(v: boolean): void;
   startNextCycle: () => Promise<void>;
+}
+
+/**
+ * Backstop STOP_MARKET so the position is never left without an exchange-side stop
+ * when the normal SL is skipped (deferred ladder SL, infeasible geometry, harvest near-SL).
+ * Max loss at current qty = riskAmount × CATASTROPHIC_SL_MULT.
+ */
+async function placeCatastrophicSl(
+  l: LadderState,
+  pos: PositionSnapshot,
+  closeSide: 'BUY' | 'SELL',
+  currentPrice: number,
+  tickSize: number,
+  reason: string
+): Promise<void> {
+  l.slAlgoId = null;
+  l.slPrice = null;
+  l.slIsCatastrophic = false;
+
+  const slPrice = computeCatastrophicSlPrice(pos.side!, pos.entry, pos.qty, l.riskAmount, tickSize);
+  if (slPrice <= 0) {
+    logger.error('[Exit] Cannot compute catastrophic SL — position UNPROTECTED', { reason, pos });
+    return;
+  }
+
+  if (currentPrice > 0 && wouldSlTriggerNow(pos.side!, slPrice, currentPrice, tickSize)) {
+    logger.error(
+      `[Exit] Catastrophic SL @ ${slPrice} would trigger now (price ${currentPrice}) — closing at market (${reason})`
+    );
+    try {
+      await client.submitNewOrder({
+        symbol: SYMBOL,
+        side: closeSide,
+        type: 'MARKET',
+        quantity: pos.qty,
+        reduceOnly: 'true',
+      });
+    } catch (e: unknown) {
+      logger.error('[Exit] Emergency market close failed', { error: formatError(e) });
+    }
+    return;
+  }
+
+  try {
+    const res = await client.submitNewAlgoOrder({
+      algoType: 'CONDITIONAL',
+      symbol: SYMBOL,
+      side: closeSide,
+      type: 'STOP_MARKET',
+      triggerPrice: slPrice,
+      closePosition: 'true',
+    });
+    l.slAlgoId = Number(res.algoId);
+    l.slPrice = slPrice;
+    l.slIsCatastrophic = true;
+    logger.warn(
+      `[Exit] Catastrophic backstop SL placed: ${closeSide} STOP_MARKET @ ${slPrice} ` +
+        `(max loss $${(l.riskAmount * CATASTROPHIC_SL_MULT).toFixed(2)} = ${CATASTROPHIC_SL_MULT}× risk — ${reason})`
+    );
+  } catch (e: unknown) {
+    logger.error('[Exit] FAILED to place catastrophic SL — position UNPROTECTED', {
+      error: formatError(e),
+      slPrice,
+      reason,
+    });
+  }
 }
 
 export async function refreshExits(host: ExitPhaseHost): Promise<void> {
@@ -60,6 +126,18 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
         currentPrice = parseFloat((priceRes as { markPrice: string }).markPrice);
       } catch { /* bookTicker will catch up */ }
     }
+
+    if (harvestMode) {
+      const dir = tradeSide === 'LONG' ? 1 : -1;
+      const base = l.harvestPeakPrice && l.harvestPeakPrice > 0 ? l.harvestPeakPrice : pos.entry;
+      l.harvestPeakPrice =
+        currentPrice > 0
+          ? dir === 1
+            ? Math.max(base, currentPrice)
+            : Math.min(base, currentPrice)
+          : base;
+    }
+
     const exitOptions = buildExitPriceOptions(
       l,
       host.precision,
@@ -94,7 +172,8 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
     if (!skipSl) {
       try {
         const slLabel = harvestMode
-          ? `harvest SL ${((exits.slDistance / pos.entry) * 100).toFixed(2)}% (target $${exits.slTargetUsd.toFixed(2)})`
+          ? `harvest SL ${((exits.slDistance / pos.entry) * 100).toFixed(2)}% ` +
+            `(breakeven/trail, peak ${l.harvestPeakPrice ?? '?'})`
           : slFromFullLadder
             ? `full ladder max loss $${l.riskAmount.toFixed(2)} beyond deepest rung`
             : `max loss $${l.riskAmount.toFixed(2)} (${((exits.slDistance / pos.entry) * 100).toFixed(2)}%)`;
@@ -110,14 +189,16 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
           closePosition: 'true',
         });
         l.slAlgoId = Number(slRes.algoId);
+        l.slPrice = slPrice;
+        l.slIsCatastrophic = false;
         logger.info(`[Exit] SL updated: ${closeSide} STOP_MARKET @ ${slPrice}`);
       } catch (e: unknown) {
         const msg = formatError(e);
         logger.error('[Exit] FAILED to place SL', { error: msg, slPrice });
         if (msg.toLowerCase().includes('immediately trigger')) {
           if (harvestMode) {
-            logger.warn('[Exit] Harvest SL rejected (immediate trigger) — continuing with TP only.');
-            l.slAlgoId = null;
+            logger.warn('[Exit] Harvest SL rejected (immediate trigger) — placing catastrophic backstop.');
+            await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'harvest SL rejected');
           } else {
             logger.warn('[Exit] SL would trigger immediately — closing at market.');
             try {
@@ -133,10 +214,12 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
             }
             return;
           }
+        } else {
+          l.slAlgoId = null;
+          l.slPrice = null;
         }
       }
     } else if (deferSl) {
-      l.slAlgoId = null;
       const entrySide = l.side ? activeEntrySide(l.side) : null;
       const placed = entrySide ? countFilledOnSide(l, entrySide) + countOpenOnSide(l, entrySide) : 0;
       const deepest = exitOptions.buildingSlProjection?.deepestPrice;
@@ -145,17 +228,18 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
         `[Exit] SL deferred: ${placed}/${levels} ladder orders placed ` +
           `(SL @ ${slPrice}${deepest != null ? ` beyond deepest ${deepest}` : ''} — max loss $${l.riskAmount.toFixed(2)} when full ladder fills)`
       );
+      await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'building SL deferred');
     } else if (skipSl && !harvestMode) {
-      l.slAlgoId = null;
       logger.error(
-        `[Exit] SL skipped: ladder geometry infeasible — cannot place SL beyond deepest rung ` +
+        `[Exit] Normal SL skipped: ladder geometry infeasible — cannot place SL beyond deepest rung ` +
           `(deepest ${exitOptions.buildingSlProjection?.deepestPrice ?? '?'}, risk $${l.riskAmount.toFixed(2)})`
       );
+      await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'ladder geometry infeasible');
     } else {
-      l.slAlgoId = null;
       logger.warn(
-        `[Exit] Harvest TP-only mode: price ${currentPrice} already near SL zone — skipping SL, TP @ ${tpPrice}`
+        `[Exit] Harvest SL near current price ${currentPrice} — placing catastrophic backstop, TP @ ${tpPrice}`
       );
+      await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'harvest SL would trigger');
     }
 
     try {

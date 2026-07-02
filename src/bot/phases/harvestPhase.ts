@@ -87,6 +87,8 @@ export async function executePartialClose(
 
   if (posAfter.qty > 0 && posAfter.side) {
     l.windingDown = true;
+    // Trailing starts from the price that triggered the harvest (favorable by definition).
+    l.harvestPeakPrice = price;
     await stateManager.updatePhase('HARVESTING', undefined, undefined, undefined, posAfter.entry, posAfter.side);
     await persistLadderState(l, 'HARVESTING');
 

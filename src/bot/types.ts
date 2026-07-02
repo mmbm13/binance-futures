@@ -25,6 +25,12 @@ export interface LadderState {
   tpClientOrderId: string | null;
   windingDown: boolean;
   ladderStep: number;
+  /** Trigger price of the SL currently on the exchange (null when no SL placed). */
+  slPrice?: number | null;
+  /** True when the active SL is the wide catastrophic backstop, not the normal SL. */
+  slIsCatastrophic?: boolean;
+  /** Best favorable price since harvest began (drives trailing SL). */
+  harvestPeakPrice?: number;
   /** Set when risk-sized ladder cannot place more levels (account too small). */
   ladderSizingBlocked?: boolean;
   /** Effective rung count after risk/geometry resolution (defaults to config LADDER_LEVELS). */

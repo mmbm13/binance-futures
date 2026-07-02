@@ -20,7 +20,12 @@ export function buildExitPriceOptions(
 ): ExitPriceOptions {
   const options: ExitPriceOptions = { harvestMode, currentPrice };
 
-  if (!harvestMode && ladder.side) {
+  if (harvestMode) {
+    options.harvestPeakPrice = ladder.harvestPeakPrice ?? 0;
+    return options;
+  }
+
+  if (ladder.side) {
     const levels = effectiveLadderLevels(ladder);
 
     // Ladder cannot extend — protect open position with risk-sized SL on current qty.

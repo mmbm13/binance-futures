@@ -1,4 +1,12 @@
-import { BUILDING_TP_MAX_PCT, HARVEST_SL_MAX_PCT, HARVEST_TP_MAX_PCT, TP_REWARD_RATIO } from '../config';
+import {
+  BUILDING_TP_MAX_PCT,
+  CATASTROPHIC_SL_MULT,
+  HARVEST_BREAKEVEN_BUFFER_PCT,
+  HARVEST_SL_MAX_PCT,
+  HARVEST_TP_MAX_PCT,
+  HARVEST_TRAIL_PCT,
+  TP_REWARD_RATIO,
+} from '../config';
 import { buildingSlPrice } from '../ladder/sizing';
 import { roundStep } from '../math';
 
@@ -29,12 +37,51 @@ export interface ExitPriceOptions {
   harvestMode?: boolean;
   harvestTpMaxPct?: number;
   harvestSlMaxPct?: number;
+  /** Best favorable price since harvest began (drives the trailing SL). */
+  harvestPeakPrice?: number;
+  harvestBreakevenBufferPct?: number;
+  harvestTrailPct?: number;
   buildingTpMaxPct?: number;
   /** SL from full-ladder projection: beyond deepest rung, max loss = riskAmount. */
   buildingSlProjection?: BuildingSlProjection;
   /** No SL until every ladder limit is placed (OPEN or FILLED). */
   deferBuildingSl?: boolean;
   currentPrice?: number;
+}
+
+/**
+ * Harvest SL: never worse than breakeven ± buffer, ratcheted by a trailing stop
+ * from the best favorable price since harvest began.
+ */
+export function computeHarvestSlPrice(
+  side: 'LONG' | 'SHORT',
+  entry: number,
+  peakPrice: number,
+  tickSize: number,
+  breakevenBufferPct: number = HARVEST_BREAKEVEN_BUFFER_PCT,
+  trailPct: number = HARVEST_TRAIL_PCT
+): number {
+  const dir = side === 'LONG' ? 1 : -1;
+  const breakeven = entry * (1 + dir * breakevenBufferPct);
+  const peak = peakPrice > 0 ? peakPrice : entry;
+  const trail = peak * (1 - dir * trailPct);
+  const raw = side === 'LONG' ? Math.max(breakeven, trail) : Math.min(breakeven, trail);
+  return Math.max(tickSize, roundStep(raw, tickSize));
+}
+
+/** Wide backstop SL (max loss = riskAmount × mult at current qty) for when the normal SL is skipped. */
+export function computeCatastrophicSlPrice(
+  side: 'LONG' | 'SHORT',
+  entry: number,
+  qty: number,
+  riskAmount: number,
+  tickSize: number,
+  mult: number = CATASTROPHIC_SL_MULT
+): number {
+  if (entry <= 0 || qty <= 0 || riskAmount <= 0 || mult <= 0) return 0;
+  const dir = side === 'LONG' ? 1 : -1;
+  const distance = (riskAmount * mult) / qty;
+  return Math.max(tickSize, roundStep(entry - dir * distance, tickSize));
 }
 
 /** True if market price has already reached the stop trigger level. */
@@ -75,11 +122,23 @@ export function computeExitPrices(
   let tpDistance = (riskAmount * tpRewardRatio) / tpQty;
   let skipSl = false;
   let slPrice = 0;
+  const currentPrice = options.currentPrice ?? 0;
 
   if (harvestMode) {
     tpDistance = tpEntry * harvestTpMaxPct;
-    slDistance = slEntry * harvestSlMaxPct;
-    slPrice = Math.max(tickSize, roundStep(slEntry - dir * slDistance, tickSize));
+    slPrice = computeHarvestSlPrice(
+      side,
+      slEntry,
+      options.harvestPeakPrice ?? 0,
+      tickSize,
+      options.harvestBreakevenBufferPct,
+      options.harvestTrailPct
+    );
+    if (currentPrice > 0 && wouldSlTriggerNow(side, slPrice, currentPrice, tickSize)) {
+      // Breakeven/trail level already breached — fall back to the wide symmetric harvest SL.
+      slPrice = Math.max(tickSize, roundStep(slEntry - dir * slEntry * harvestSlMaxPct, tickSize));
+    }
+    slDistance = Math.abs(slPrice - slEntry);
   } else {
     tpDistance = Math.min(tpDistance, tpEntry * buildingTpMaxPct);
 
@@ -100,15 +159,10 @@ export function computeExitPrices(
     }
   }
 
-  if (slPrice <= 0 && !skipSl && harvestMode) {
-    slPrice = Math.max(tickSize, roundStep(slEntry - dir * slDistance, tickSize));
-  }
-
   const tpPrice = Math.max(tickSize, roundStep(tpEntry + dir * tpDistance, tickSize));
   const tpTargetUsd = tpDistance * tpQty;
   const slTargetUsd = harvestMode ? slDistance * tpQty : riskAmount;
 
-  const currentPrice = options.currentPrice ?? 0;
   if (options.deferBuildingSl) {
     skipSl = true;
   } else if (harvestMode && currentPrice > 0 && wouldSlTriggerNow(side, slPrice, currentPrice, tickSize)) {

@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeExitPrices, wouldSlTriggerNow } from '../phases/exitPricing';
+import {
+  computeCatastrophicSlPrice,
+  computeExitPrices,
+  computeHarvestSlPrice,
+  wouldSlTriggerNow,
+} from '../phases/exitPricing';
 
 describe('computeExitPrices', () => {
   it('sizes SL and TP for symmetric dollar risk on LONG at full size', () => {
@@ -50,23 +55,32 @@ describe('computeExitPrices', () => {
     assert.equal(exits.mode, 'building');
   });
 
-  it('uses symmetric % TP and SL in harvest mode (not building risk/qty)', () => {
-    const harvest = computeExitPrices('SHORT', 1695, 0.014, 0.82, 0.01, 1.5, {
-      harvestMode: true,
-    });
-    const building = computeExitPrices('SHORT', 1695, 0.014, 0.82, 0.01, 1.5);
-    assert.equal(harvest.mode, 'harvest');
-    assert.ok((harvest.slDistance / 1695) * 100 < 2);
-    assert.ok((building.slDistance / 1695) * 100 > 3);
-    assert.ok(harvest.slPrice < building.slPrice);
-  });
-
-  it('uses symmetric % TP and SL in harvest mode', () => {
+  it('uses breakeven SL (never symmetric loss) in harvest mode', () => {
     const exits = computeExitPrices('SHORT', 1695, 0.014, 0.82, 0.01, 1.5, {
       harvestMode: true,
     });
     assert.equal(exits.mode, 'harvest');
     assert.equal(exits.skipSl, false);
+    // SHORT breakeven SL sits just below entry (locks ~0 instead of risking -1.5%)
+    assert.ok(exits.slPrice < 1695);
+    assert.ok(exits.slPrice > 1695 * 0.997);
+  });
+
+  it('falls back to wide symmetric harvest SL when breakeven is already breached', () => {
+    const exits = computeExitPrices('SHORT', 1695, 0.014, 0.82, 0.01, 1.5, {
+      harvestMode: true,
+      currentPrice: 1694,
+    });
+    assert.equal(exits.skipSl, false);
+    assert.ok(Math.abs(exits.slPrice - 1695 * 1.015) < 0.05);
+  });
+
+  it('skips harvest SL entirely when even the fallback would trigger (backstop takes over)', () => {
+    const exits = computeExitPrices('SHORT', 1695, 0.014, 0.82, 0.01, 1.5, {
+      harvestMode: true,
+      currentPrice: 1725,
+    });
+    assert.equal(exits.skipSl, true);
   });
 
   it('skips building SL when full-ladder geometry is infeasible', () => {
@@ -81,6 +95,47 @@ describe('computeExitPrices', () => {
     });
     assert.equal(exits.skipSl, true);
     assert.equal(exits.slPrice, 0);
+  });
+});
+
+describe('computeHarvestSlPrice', () => {
+  it('floors at breakeven when peak has not moved', () => {
+    const sl = computeHarvestSlPrice('SHORT', 1695, 1695, 0.01);
+    assert.ok(Math.abs(sl - 1695 * (1 - 0.001)) < 0.02);
+  });
+
+  it('trails the peak once it beats breakeven (SHORT)', () => {
+    const sl = computeHarvestSlPrice('SHORT', 1695, 1650, 0.01);
+    assert.ok(Math.abs(sl - 1650 * 1.0075) < 0.02);
+    assert.ok(sl < computeHarvestSlPrice('SHORT', 1695, 1695, 0.01));
+  });
+
+  it('trails the peak once it beats breakeven (LONG)', () => {
+    const sl = computeHarvestSlPrice('LONG', 1700, 1730, 0.01);
+    assert.ok(Math.abs(sl - 1730 * 0.9925) < 0.02);
+    assert.ok(sl > 1700);
+  });
+
+  it('falls back to entry when peak is missing', () => {
+    const sl = computeHarvestSlPrice('LONG', 1700, 0, 0.01);
+    assert.ok(Math.abs(sl - 1700 * 1.001) < 0.02);
+  });
+});
+
+describe('computeCatastrophicSlPrice', () => {
+  it('places backstop at riskAmount × mult from entry', () => {
+    const sl = computeCatastrophicSlPrice('LONG', 1700, 0.014, 0.8, 0.01, 2);
+    assert.ok(Math.abs(sl - (1700 - 1.6 / 0.014)) < 0.02);
+  });
+
+  it('mirrors for SHORT', () => {
+    const sl = computeCatastrophicSlPrice('SHORT', 1700, 0.014, 0.8, 0.01, 2);
+    assert.ok(Math.abs(sl - (1700 + 1.6 / 0.014)) < 0.02);
+  });
+
+  it('returns 0 on invalid inputs', () => {
+    assert.equal(computeCatastrophicSlPrice('LONG', 1700, 0, 0.8, 0.01), 0);
+    assert.equal(computeCatastrophicSlPrice('LONG', 0, 0.014, 0.8, 0.01), 0);
   });
 });
 

@@ -50,6 +50,7 @@ import {
 } from './phases/exitPhase';
 import { isInTradePhase, resolveCyclePhase, botPhaseForLadder } from './phases/types';
 import { isHarvestMode, repairHarvestState } from './phases/harvestMode';
+import { evaluateHarvestTrail } from './phases/harvestTrail';
 
 // ─── Bot Engine (orchestrator) ───────────────────────────────────────────────
 export const botEngine = {
@@ -348,18 +349,33 @@ export const botEngine = {
     }
   },
 
-  // ─── Phase: HARVESTING (partial close on ticks) ────────────────────────────
+  // ─── Phase: HARVESTING (partial close + trailing SL on ticks) ──────────────
   onPriceTick(price: number) {
     const now = Date.now();
     if (now - this._lastTickEval < 5_000) return;
     this._lastTickEval = now;
 
-    if (!canEvaluatePartialClose(this.ladder)) return;
+    if (canEvaluatePartialClose(this.ladder)) {
+      this.runExclusive(async () => {
+        const changed = await executePartialClose(this.buildHost(), price);
+        if (changed) await persistLadderState(this.ladder);
+      }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
+      return;
+    }
 
-    this.runExclusive(async () => {
-      const changed = await executePartialClose(this.buildHost(), price);
-      if (changed) await persistLadderState(this.ladder);
-    }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
+    if (
+      this.ladder &&
+      !this._refreshingExits &&
+      evaluateHarvestTrail(this.ladder, price, this.tickSize)
+    ) {
+      logger.info(
+        `[Harvest] Trailing SL update: peak ${this.ladder.harvestPeakPrice}, current SL ${this.ladder.slPrice ?? 'none'}`
+      );
+      this.runExclusive(async () => {
+        await runRefreshExits(this.buildHost());
+        await persistLadderState(this.ladder);
+      }).catch((e) => logger.error('Error updating trailing SL', { error: e }));
+    }
   },
 
   // ─── Phase: BUILDING ───────────────────────────────────────────────────────

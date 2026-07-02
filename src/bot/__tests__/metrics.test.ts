@@ -85,6 +85,9 @@ describe('buildCycleMetrics', () => {
     const metrics = buildCycleMetrics({ ...baseState, phase: 'HARVESTING' }, ladder);
     assert.equal(metrics.cyclePhase, 'HARVESTING');
     assert.equal(metrics.windingDown, true);
-    assert.ok(Math.abs(metrics.exits!.tpTargetUsd - metrics.exits!.slTargetUsd) < 0.01);
+    // Breakeven/trailing SL locks in near entry: SL target much smaller than TP target.
+    assert.ok(metrics.exits!.slTargetUsd < metrics.exits!.tpTargetUsd);
+    assert.ok(metrics.exits!.slPrice < 1696);
+    assert.ok(metrics.exits!.slPrice > 1696 * 0.997);
   });
 });
