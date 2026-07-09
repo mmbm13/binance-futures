@@ -211,6 +211,9 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
           if (harvestMode) {
             logger.warn('[Exit] Harvest SL rejected (immediate trigger) — placing catastrophic backstop.');
             await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'harvest SL rejected');
+          } else if (l.buildingTrailActive) {
+            logger.warn('[Exit] Building trail SL at floor rejected — catastrophic backstop until price extends.');
+            await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'building trail SL at floor');
           } else {
             logger.warn('[Exit] SL would trigger immediately — closing at market.');
             try {
@@ -231,6 +234,11 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
           l.slPrice = null;
         }
       }
+    } else if (l.buildingTrailActive && skipSl) {
+      logger.info(
+        `[Exit] Building trail SL deferred at floor ${slPrice} (price ${currentPrice}) — catastrophic backstop until extension`
+      );
+      await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'building trail SL deferred at floor');
     } else if (deferSl) {
       const entrySide = l.side ? activeEntrySide(l.side) : null;
       const placed = entrySide ? countFilledOnSide(l, entrySide) + countOpenOnSide(l, entrySide) : 0;
@@ -275,9 +283,10 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
       }
     } else {
       l.tpClientOrderId = null;
-      logger.info(
-        `[Exit] Fixed TP omitted (${mode} trail): trailing SL @ ${slPrice}, peak ${l.buildingPeakPrice ?? '?'}`
-      );
+      const tpReason = l.buildingTrailActive
+        ? `trail active, SL @ ${slPrice}, peak ${l.buildingPeakPrice ?? '?'}`
+        : 'awaiting trail activation (no fixed TP — exits via trail at activation %)';
+      logger.info(`[Exit] Fixed TP omitted: ${tpReason}`);
     }
   } finally {
     host.setRefreshingExits(false);

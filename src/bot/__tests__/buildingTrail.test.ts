@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   activateBuildingTrail,
   buildingTrailActivationReached,
+  buildingTrailFloorBreached,
   canEvaluateBuildingTrail,
   evaluateBuildingTrail,
+  isAwaitingBuildingTrail,
   shouldActivateBuildingTrail,
 } from '../phases/buildingTrail';
 import { computeBuildingTrailSlPrice, computeExitPrices } from '../phases/exitPricing';
@@ -98,6 +100,51 @@ describe('computeExitPrices building trail', () => {
     assert.equal(exits.skipTp, true);
     assert.equal(exits.skipSl, false);
     assert.ok(exits.slPrice > 101.5);
+  });
+
+  it('omits fixed TP while awaiting building trail activation', () => {
+    const exits = computeExitPrices('SHORT', 1670, 0.014, 0.81, TICK, 1.5, {
+      awaitingBuildingTrail: true,
+    });
+    assert.equal(exits.skipTp, true);
+    assert.equal(exits.skipSl, false);
+  });
+
+  it('defers trail SL at floor when price is still at activation level', () => {
+    const exits = computeExitPrices('LONG', 100, 0.014, 0.8, TICK, 1.5, {
+      buildingTrailActive: true,
+      buildingTrailPeakPrice: 101.5,
+      buildingTrailFloorPct: 0.015,
+      buildingTrailPct: 0.0075,
+      currentPrice: 101.5,
+    });
+    assert.equal(exits.skipTp, true);
+    assert.equal(exits.skipSl, true);
+  });
+});
+
+describe('isAwaitingBuildingTrail', () => {
+  it('is true for first fill before activation', () => {
+    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.014, entryPrice: 100 });
+    assert.equal(isAwaitingBuildingTrail(l), true);
+    l.buildingTrailActive = true;
+    assert.equal(isAwaitingBuildingTrail(l), false);
+  });
+});
+
+describe('buildingTrailFloorBreached', () => {
+  it('detects retrace through floor when only catastrophic SL is armed', () => {
+    const l = makeLadder({
+      side: 'LONG',
+      fills: 1,
+      posQty: 0.014,
+      entryPrice: 100,
+      buildingTrailActive: true,
+      slIsCatastrophic: true,
+      slPrice: 90,
+    });
+    assert.equal(buildingTrailFloorBreached(l, 101.6, TICK), false);
+    assert.equal(buildingTrailFloorBreached(l, 101.4, TICK), true);
   });
 });
 

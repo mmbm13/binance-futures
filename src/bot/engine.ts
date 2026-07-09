@@ -53,8 +53,10 @@ import { isHarvestMode, repairHarvestState } from './phases/harvestMode';
 import { evaluateHarvestTrail } from './phases/harvestTrail';
 import {
   activateBuildingTrail,
+  buildingTrailFloorBreached,
   canEvaluateBuildingTrail,
   evaluateBuildingTrail,
+  executeBuildingTrailFloorClose,
   shouldActivateBuildingTrail,
 } from './phases/buildingTrail';
 
@@ -366,6 +368,18 @@ export const botEngine = {
         const changed = await executePartialClose(this.buildHost(), price);
         if (changed) await persistLadderState(this.ladder);
       }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
+      return;
+    }
+
+    if (
+      this.ladder &&
+      !this._refreshingExits &&
+      this.ladder.buildingTrailActive &&
+      buildingTrailFloorBreached(this.ladder, price, this.tickSize)
+    ) {
+      this.runExclusive(async () => {
+        await executeBuildingTrailFloorClose(this.ladder!, price, this.tickSize);
+      }).catch((e) => logger.error('Error on building trail floor close', { error: e }));
       return;
     }
 

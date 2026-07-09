@@ -54,6 +54,8 @@ export interface ExitPriceOptions {
   buildingTrailPeakPrice?: number;
   buildingTrailFloorPct?: number;
   buildingTrailPct?: number;
+  /** First fill + trail enabled: omit fixed TP until activation (no race with limit at 1.5%). */
+  awaitingBuildingTrail?: boolean;
   currentPrice?: number;
 }
 
@@ -184,6 +186,9 @@ export function computeExitPrices(
       options.buildingTrailPct
     );
     slDistance = Math.abs(slPrice - slEntry);
+    if (currentPrice > 0 && wouldSlTriggerNow(side, slPrice, currentPrice, tickSize)) {
+      skipSl = true;
+    }
   } else {
     tpDistance = Math.min(tpDistance, tpEntry * buildingTpMaxPct);
 
@@ -225,6 +230,6 @@ export function computeExitPrices(
     dir,
     mode,
     skipSl,
-    skipTp: options.buildingTrailActive ?? false,
+    skipTp: Boolean(options.buildingTrailActive || options.awaitingBuildingTrail),
   };
 }

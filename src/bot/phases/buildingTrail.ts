@@ -1,12 +1,20 @@
 import {
   BUILDING_TRAIL_ACTIVATION_PCT,
   BUILDING_TRAIL_ENABLED,
+  BUILDING_TRAIL_FLOOR_PCT,
   BUILDING_TRAIL_MIN_STEP_PCT,
+  SYMBOL,
 } from '../config';
+import { client } from '../client';
 import { cancelByClientOrderId } from '../exchange';
 import { LadderState } from '../types';
 import { computeBuildingTrailSlPrice, wouldSlTriggerNow } from './exitPricing';
 import { logger } from '../../utils/logger';
+
+/** First fill with trail enabled — fixed TP omitted until activation. */
+export function isAwaitingBuildingTrail(ladder: LadderState | null): boolean {
+  return canEvaluateBuildingTrail(ladder) && !ladder!.buildingTrailActive;
+}
 
 /** True when building trail can be evaluated (first fill only, not harvest). */
 export function canEvaluateBuildingTrail(ladder: LadderState | null): boolean {
@@ -106,4 +114,55 @@ export function evaluateBuildingTrail(
 
   const improvement = (desiredSl - currentSl) * dir;
   return improvement >= ladder.entryPrice * minStepPct;
+}
+
+export function buildingTrailFloorPrice(
+  side: 'LONG' | 'SHORT',
+  entry: number,
+  floorPct: number = BUILDING_TRAIL_FLOOR_PCT
+): number {
+  const dir = side === 'LONG' ? 1 : -1;
+  return entry * (1 + dir * floorPct);
+}
+
+/** True when price retraces through the profit floor while trail SL is not yet armed. */
+export function buildingTrailFloorBreached(
+  ladder: LadderState,
+  price: number,
+  tickSize: number,
+  floorPct: number = BUILDING_TRAIL_FLOOR_PCT
+): boolean {
+  if (!ladder.buildingTrailActive || !ladder.side || price <= 0) return false;
+  if (!ladder.slIsCatastrophic && ladder.slPrice && ladder.slPrice > 0) return false;
+  const floor = buildingTrailFloorPrice(ladder.side, ladder.entryPrice, floorPct);
+  return wouldSlTriggerNow(ladder.side, floor, price, tickSize);
+}
+
+/** Market close when floor is breached before the trailing SL could be placed. */
+export async function executeBuildingTrailFloorClose(
+  ladder: LadderState,
+  price: number,
+  tickSize: number = 0.01
+): Promise<boolean> {
+  if (!buildingTrailFloorBreached(ladder, price, tickSize)) return false;
+
+  const closeSide = ladder.side === 'LONG' ? 'SELL' : 'BUY';
+  logger.info(
+    `[Build] Building trail floor breached @ ${price} (floor ${buildingTrailFloorPrice(ladder.side!, ladder.entryPrice).toFixed(4)}) — closing at market`
+  );
+
+  try {
+    await client.submitNewOrder({
+      symbol: SYMBOL,
+      side: closeSide,
+      type: 'MARKET',
+      quantity: ladder.posQty,
+      reduceOnly: 'true',
+    });
+    return true;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.error('[Build] Building trail floor close failed', { error: msg });
+    return false;
+  }
 }

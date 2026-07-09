@@ -10,6 +10,7 @@ import { LadderState, SymbolPrecision } from '../types';
 import { BotPhase } from '../state';
 import { computeExitPrices, ExitPriceOptions } from './exitPricing';
 import { isHarvestMode } from './harvestMode';
+import { isAwaitingBuildingTrail } from './buildingTrail';
 
 export function buildExitPriceOptions(
   ladder: LadderState,
@@ -31,6 +32,10 @@ export function buildExitPriceOptions(
     options.buildingTrailFloorPct = BUILDING_TRAIL_FLOOR_PCT;
     options.buildingTrailPct = BUILDING_TRAIL_PCT;
     return options;
+  }
+
+  if (isAwaitingBuildingTrail(ladder)) {
+    options.awaitingBuildingTrail = true;
   }
 
   if (ladder.side) {
