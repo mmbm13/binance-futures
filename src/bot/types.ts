@@ -31,6 +31,10 @@ export interface LadderState {
   slIsCatastrophic?: boolean;
   /** Best favorable price since harvest began (drives trailing SL). */
   harvestPeakPrice?: number;
+  /** True after first-fill building trail arms (fixed TP removed, trailing SL active). */
+  buildingTrailActive?: boolean;
+  /** Best favorable price since building trail activation. */
+  buildingPeakPrice?: number;
   /** Set when risk-sized ladder cannot place more levels (account too small). */
   ladderSizingBlocked?: boolean;
   /** Effective rung count after risk/geometry resolution (defaults to config LADDER_LEVELS). */

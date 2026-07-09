@@ -100,7 +100,9 @@ export function needsLadderPlacement(
   exchangeEntryCount: number,
   ladderLevels: number = LADDER_LEVELS
 ): boolean {
-  if (!ladder.side || ladder.windingDown || ladder.partialCloses > 0) return false;
+  if (!ladder.side || ladder.windingDown || ladder.partialCloses > 0 || ladder.buildingTrailActive) {
+    return false;
+  }
   const entrySide = activeEntrySide(ladder.side);
   const filled = countFilledOnSide(ladder, entrySide);
   const open = countOpenOnSide(ladder, entrySide);
@@ -134,6 +136,7 @@ export async function placeLadderOrders(host: BuildPhaseHost): Promise<void> {
     return;
   }
   if (l.windingDown || isHarvestMode(l, undefined, pos.qty, exchangeEntryCount, stepSize)) return;
+  if (l.buildingTrailActive) return;
   if (l.ladderSizingBlocked) {
     logger.info('[Build] Ladder sizing blocked — not placing more levels');
     return;

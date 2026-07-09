@@ -96,6 +96,18 @@ describe('computeExitPrices', () => {
     assert.equal(exits.skipSl, true);
     assert.equal(exits.slPrice, 0);
   });
+
+  it('defers building SL but not when building trail is active', () => {
+    const exits = computeExitPrices('SHORT', 1670, 0.014, 0.81, 0.01, 1.5, {
+      deferBuildingSl: true,
+      buildingTrailActive: true,
+      buildingTrailPeakPrice: 1645,
+      buildingTrailFloorPct: 0.015,
+      buildingTrailPct: 0.0075,
+    });
+    assert.equal(exits.skipSl, false);
+    assert.equal(exits.skipTp, true);
+  });
 });
 
 describe('computeHarvestSlPrice', () => {

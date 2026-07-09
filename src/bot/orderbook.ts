@@ -65,6 +65,9 @@ class OrderBookCollector {
 
   currentPrice = 0;
   currentPriceSource: PriceSource = 'none';
+  /** Best bid/ask from bookTicker (0 until the first event arrives). */
+  currentBid = 0;
+  currentAsk = 0;
   onPrice: ((price: number) => void) | null = null;
 
   private publishPrice(price: number, source: Exclude<PriceSource, 'none'>) {
@@ -84,8 +87,12 @@ class OrderBookCollector {
       const ev = ((msg as { data?: Record<string, unknown> })?.data ?? msg) as Record<string, unknown>;
 
       if (ev?.e === 'bookTicker' && ev.s === this.symbol) {
-        const mid = computeBookMidPrice(Number(ev.b), Number(ev.a));
+        const bid = Number(ev.b);
+        const ask = Number(ev.a);
+        const mid = computeBookMidPrice(bid, ask);
         if (mid !== null) {
+          this.currentBid = bid;
+          this.currentAsk = ask;
           this.lastBookTickerAt = Date.now();
           this.publishPrice(mid, 'bookTicker');
         }
@@ -261,6 +268,8 @@ class OrderBookCollector {
     }
     this.currentPrice = 0;
     this.currentPriceSource = 'none';
+    this.currentBid = 0;
+    this.currentAsk = 0;
     this.lastBookTickerAt = 0;
   }
 }

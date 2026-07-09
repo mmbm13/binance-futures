@@ -1,4 +1,4 @@
-import { LADDER_LEVELS, TP_REWARD_RATIO } from '../config';
+import { LADDER_LEVELS, TP_REWARD_RATIO, BUILDING_TRAIL_FLOOR_PCT, BUILDING_TRAIL_PCT } from '../config';
 import { effectiveLadderLevels, isLadderFullyPlaced } from '../ladder/coverage';
 import { buildingSlPrice } from '../ladder/sizing';
 import {
@@ -22,6 +22,14 @@ export function buildExitPriceOptions(
 
   if (harvestMode) {
     options.harvestPeakPrice = ladder.harvestPeakPrice ?? 0;
+    return options;
+  }
+
+  if (ladder.buildingTrailActive) {
+    options.buildingTrailActive = true;
+    options.buildingTrailPeakPrice = ladder.buildingPeakPrice ?? 0;
+    options.buildingTrailFloorPct = BUILDING_TRAIL_FLOOR_PCT;
+    options.buildingTrailPct = BUILDING_TRAIL_PCT;
     return options;
   }
 

@@ -1,6 +1,6 @@
 
 import { WebsocketClient } from 'binance';
-import { botEngine } from './engine';
+import { getActiveStrategy } from '../strategies/registry';
 import dotenv from 'dotenv';
 import { logger } from '../utils/logger';
 
@@ -67,7 +67,7 @@ export const wsManager = {
       logger.info('[WS] Reconnected', { wsKey: data?.wsKey });
       // Sync state after reconnection to ensure consistency
       try {
-        await botEngine.syncStateWithBinance();
+        await getActiveStrategy().sync();
         logger.info('[WS] State synced after reconnection.');
       } catch (e) {
         logger.error('[WS] Error syncing state after reconnection', { error: e });
@@ -93,7 +93,7 @@ export const wsManager = {
         });
 
         try {
-          await botEngine.handleOrderUpdate(data);
+          await getActiveStrategy().onOrderUpdate(data);
         } catch (e) {
           logger.error('[WS] Error handling order update', { error: e });
         }
@@ -105,7 +105,7 @@ export const wsManager = {
         logger.info('[WS] Algo Update', { symbol: algo.symbol, type: algo.orderType, status: algo.algoStatus, algoId: algo.algoId });
 
         try {
-          await botEngine.handleAlgoUpdate(data);
+          await getActiveStrategy().onAlgoUpdate(data);
         } catch (e) {
           logger.error('[WS] Error handling algo update', { error: e });
         }

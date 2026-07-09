@@ -1,68 +1,63 @@
+import '../config/env'; // MUST be first: layers .env.<strategy> over .env
 import Fastify from 'fastify';
 import fs from 'fs';
 import path from 'path';
-import { botEngine, SYMBOL } from '../bot/engine';
 import { db } from '../db';
 import * as dotenv from 'dotenv';
 import { stateManager } from '../bot/state';
 import { wsManager } from '../bot/websocket';
-import { client } from '../bot/client';
 import { logger } from '../utils/logger';
 import {
-  buildCycleMetrics,
   computeTradeMetrics,
   fetchAllTrades,
   fetchRecentTrades,
 } from '../bot/metrics';
+import { buildComparison } from '../bot/compareMetrics';
+import { getActiveStrategy, STRATEGY_ID, EXECUTION_MODE } from '../strategies/registry';
+import { startEquitySnapshots, stopEquitySnapshots } from '../monitor/equity';
 import { requireApiKey } from './auth';
 import {
   getLogFilePath,
   getLogFileStats,
-  readLogTail,
+  readLogs,
   readLogTailAsText,
   resolveLogFile,
+  resolveLogOrder,
 } from './logReader';
 
 dotenv.config();
 
 const fastify = Fastify({ logger: true });
 
-// Start Bot
+// Start Bot — always invokes strategy.start() so multiple paper processes can boot independently
 fastify.post('/start', async (_request, reply) => {
   const state = await stateManager.getState();
-  if (state.status === 'RUNNING') {
-    return reply.code(200).send({ status: 'already_running', phase: state.phase });
+  const wasRunning = state.status === 'RUNNING';
+  if (!wasRunning) {
+    await stateManager.updateStatus('RUNNING');
   }
-  await stateManager.updateStatus('RUNNING');
-  // If the engine wasn't initialized yet (e.g. first start), init it
-  if (!botEngine.initialized) {
-    await botEngine.init();
-    await wsManager.start();
-  } else {
-    // If already initialized, sync state with Binance.
-    // This starts a fresh cycle (order book collection) when flat.
-    await botEngine.syncStateWithBinance();
-  }
-  return { status: 'started' };
+  await getActiveStrategy().start();
+  return reply.code(200).send({
+    status: 'started',
+    strategy: STRATEGY_ID,
+    wasAlreadyRunning: wasRunning,
+  });
 });
 
-// Stop Bot — stops collection timers/streams and cancels all open orders
-fastify.post('/stop', async (_request, reply) => {
-  await stateManager.updateStatus('STOPPED');
-
-  // Stop order book collection / timers
-  await botEngine.stop();
-
-  // Cancel all open orders (regular + algo) to prevent orphaned orders
-  try {
-    await client.cancelAllOpenOrders({ symbol: SYMBOL });
-  } catch (_) { /* no regular orders is fine */ }
-  try {
-    await client.cancelAllAlgoOpenOrders({ symbol: SYMBOL });
-  } catch (_) { /* no algo orders is fine */ }
-  fastify.log.info('Canceled all open orders (regular + algo) on stop.');
-
-  return { status: 'stopped', message: 'Bot stopped and open orders canceled.' };
+// Stop Bot — local strategy only; in paper mode keep global RUNNING for sibling processes
+fastify.post('/stop', async (_request, _reply) => {
+  await getActiveStrategy().stop();
+  if (EXECUTION_MODE !== 'paper') {
+    await stateManager.updateStatus('STOPPED');
+  }
+  return {
+    status: 'stopped',
+    strategy: STRATEGY_ID,
+    message:
+      EXECUTION_MODE === 'paper'
+        ? 'Strategy stopped locally (global RUNNING preserved for other paper bots).'
+        : 'Bot stopped and open orders canceled.',
+  };
 });
 
 // Get Status
@@ -72,11 +67,18 @@ fastify.get('/status', async (_request, _reply) => {
   const recentTrades = await fetchRecentTrades(db, 5);
 
   return {
+    strategy: STRATEGY_ID,
+    executionMode: EXECUTION_MODE,
     state,
-    cycle: buildCycleMetrics(state, botEngine.ladder, botEngine.tickSize),
+    cycle: await getActiveStrategy().getMetrics(),
     performance: computeTradeMetrics(allTrades),
     recentTrades,
   };
+});
+
+// Per-strategy comparison table (expectancy, profit factor, drawdown, Sharpe, fees)
+fastify.get('/compare', async (_request, _reply) => {
+  return buildComparison(db);
 });
 
 // Get History
@@ -94,41 +96,93 @@ fastify.get('/logs', async (request, reply) => {
     file?: string;
     level?: string;
     search?: string;
+    from?: string;
+    to?: string;
+    order?: string;
     format?: string;
   };
 
   const file = resolveLogFile(q.file);
+  const order = resolveLogOrder(q.order);
   const lines = q.lines ? Number(q.lines) : 200;
-  const opts = { file, lines, level: q.level, search: q.search };
 
-  if (q.format === 'text') {
-    reply.type('text/plain; charset=utf-8');
-    return readLogTailAsText(opts);
+  try {
+    const opts = {
+      file,
+      lines: Number.isFinite(lines) ? lines : 200,
+      level: q.level,
+      search: q.search,
+      from: q.from,
+      to: q.to,
+      order,
+    };
+
+    if (q.format === 'text') {
+      reply.type('text/plain; charset=utf-8');
+      return readLogTailAsText(opts);
+    }
+
+    const result = readLogs(opts);
+    return {
+      file: result.file,
+      order: result.order,
+      filters: result.filters,
+      returned: result.entries.length,
+      totalMatching: result.total,
+      stats: getLogFileStats(file),
+      entries: result.entries,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return reply.code(400).send({ error: msg });
   }
-
-  const result = readLogTail(opts);
-  return {
-    file: result.file,
-    returned: result.entries.length,
-    totalInFile: result.total,
-    stats: getLogFileStats(file),
-    entries: result.entries,
-  };
 });
 
 fastify.get('/logs/download', async (request, reply) => {
   if (!requireApiKey(request, reply)) return;
 
-  const file = resolveLogFile((request.query as { file?: string }).file);
+  const q = request.query as {
+    file?: string;
+    from?: string;
+    to?: string;
+    order?: string;
+    level?: string;
+    search?: string;
+  };
+
+  const file = resolveLogFile(q.file);
   const filePath = getLogFilePath(file);
   if (!getLogFileStats(file).exists) {
     return reply.code(404).send({ error: 'Log file not found' });
   }
 
-  return reply
-    .header('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`)
-    .type('text/plain')
-    .send(fs.readFileSync(filePath, 'utf8'));
+  const hasFilters = q.from || q.to || q.level || q.search || q.order === 'asc';
+
+  try {
+    if (hasFilters) {
+      const text = readLogTailAsText({
+        file,
+        from: q.from,
+        to: q.to,
+        order: resolveLogOrder(q.order),
+        level: q.level,
+        search: q.search,
+      });
+      const suffix = q.from || q.to ? '-filtered' : '';
+      return reply
+        .header('Content-Disposition', `attachment; filename="${path.basename(filePath, '.log')}${suffix}.log"`)
+        .type('text/plain; charset=utf-8')
+        .send(text);
+    }
+
+    return reply
+      .header('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`)
+      .type('text/plain')
+      .send(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return reply.code(400).send({ error: msg });
+  }
 });
 
 // ─── Startup ─────────────────────────────────────────────────────────────────
@@ -136,11 +190,13 @@ const start = async () => {
   try {
     await fastify.listen({ port: Number(process.env.PORT) || 3000, host: '0.0.0.0' });
 
-    // Initialize bot engine and WebSocket (awaited for proper error propagation)
-    await botEngine.init();
+    // Initialize the active strategy and the user-data WebSocket
+    const strategy = getActiveStrategy();
+    await strategy.init();
     await wsManager.start();
+    startEquitySnapshots(STRATEGY_ID);
 
-    fastify.log.info('Bot engine and WebSocket initialized.');
+    fastify.log.info(`Strategy "${STRATEGY_ID}" (${EXECUTION_MODE}) and WebSocket initialized.`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
@@ -151,6 +207,7 @@ const start = async () => {
 async function shutdown(signal: string) {
   logger.info(`Received ${signal}. Shutting down gracefully...`);
   try {
+    stopEquitySnapshots();
     wsManager.close();
     await fastify.close();
     await db.end();

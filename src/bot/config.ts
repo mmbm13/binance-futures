@@ -17,12 +17,28 @@ export const HARVEST_TP_MAX_PCT = Number(process.env.HARVEST_TP_MAX_PCT || _harv
 export const HARVEST_SL_MAX_PCT = Number(process.env.HARVEST_SL_MAX_PCT || _harvestExitPct);
 /** Max TP distance from entry in BUILDING (caps $-symmetric TP when qty is small). */
 export const BUILDING_TP_MAX_PCT = Number(process.env.BUILDING_TP_MAX_PCT || _harvestExitPct);
+/** When true, after the first fill hits activation %, replace fixed TP with a trailing SL. */
+export const BUILDING_TRAIL_ENABLED = process.env.BUILDING_TRAIL_ENABLED !== 'false';
+/** Favorable move from entry that arms building trail (default = BUILDING_TP_MAX_PCT). */
+export const BUILDING_TRAIL_ACTIVATION_PCT = Number(
+  process.env.BUILDING_TRAIL_ACTIVATION_PCT || BUILDING_TP_MAX_PCT
+);
+/** Minimum locked profit floor for building trail SL (default = activation). */
+export const BUILDING_TRAIL_FLOOR_PCT = Number(
+  process.env.BUILDING_TRAIL_FLOOR_PCT || BUILDING_TRAIL_ACTIVATION_PCT
+);
 /** Harvest SL floor: breakeven ± buffer (covers round-trip fees). */
 export const HARVEST_BREAKEVEN_BUFFER_PCT = Number(process.env.HARVEST_BREAKEVEN_BUFFER_PCT || 0.001);
 /** Harvest trailing SL distance from the best favorable price since harvest began. */
 export const HARVEST_TRAIL_PCT = Number(process.env.HARVEST_TRAIL_PCT || 0.0075);
 /** Re-place the trailing SL only when it improves by at least this fraction of entry. */
 export const HARVEST_TRAIL_MIN_STEP_PCT = Number(process.env.HARVEST_TRAIL_MIN_STEP_PCT || 0.001);
+/** Trailing SL distance from the best favorable price since building trail activation. */
+export const BUILDING_TRAIL_PCT = Number(process.env.BUILDING_TRAIL_PCT || HARVEST_TRAIL_PCT);
+/** Re-place building trail SL only when it improves by at least this fraction of entry. */
+export const BUILDING_TRAIL_MIN_STEP_PCT = Number(
+  process.env.BUILDING_TRAIL_MIN_STEP_PCT || HARVEST_TRAIL_MIN_STEP_PCT
+);
 /** Catastrophic backstop SL distance as multiple of riskAmount (always on exchange when normal SL is skipped). */
 export const CATASTROPHIC_SL_MULT = Number(process.env.CATASTROPHIC_SL_MULT || 2.0);
 /** Min net profit as fraction of cycle risk (riskAmount) before partial close. */

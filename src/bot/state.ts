@@ -88,6 +88,21 @@ export const stateManager = {
     );
   },
 
+  /**
+   * Persist one strategy's private state under orders.<key> without touching
+   * phase/pnl semantics (updatePhase('IDLE') wipes orders — strategies other
+   * than ladder must use this instead).
+   */
+  async saveStrategyState(key: string, value: unknown) {
+    await db.query(
+      `UPDATE bot_state
+       SET orders = jsonb_set(COALESCE(orders, '{}'::jsonb), $1, $2::jsonb, true),
+           updated_at = NOW()
+       WHERE id = 1`,
+      [`{${key}}`, JSON.stringify(value)]
+    );
+  },
+
   async saveTrade(trade: {
     cycle_id: string;
     symbol: string;
@@ -96,11 +111,33 @@ export const stateManager = {
     exit_price?: number;
     pnl?: number;
     realized_pnl?: number;
+    strategy?: string;
+    qty?: number;
+    fees?: number;
+    funding?: number;
+    opened_at?: Date | null;
+    meta?: Record<string, unknown>;
   }) {
     await db.query(
-      `INSERT INTO trades (cycle_id, symbol, side, entry_price, exit_price, pnl, realized_pnl)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [trade.cycle_id, trade.symbol, trade.side, trade.entry_price, trade.exit_price, trade.pnl, trade.realized_pnl]
+      `INSERT INTO trades
+         (cycle_id, symbol, side, entry_price, exit_price, pnl, realized_pnl,
+          strategy, qty, fees, funding, opened_at, meta)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        trade.cycle_id,
+        trade.symbol,
+        trade.side,
+        trade.entry_price,
+        trade.exit_price,
+        trade.pnl,
+        trade.realized_pnl,
+        trade.strategy ?? 'ladder',
+        trade.qty ?? null,
+        trade.fees ?? 0,
+        trade.funding ?? 0,
+        trade.opened_at ?? null,
+        JSON.stringify(trade.meta ?? {}),
+      ]
     );
   }
 };

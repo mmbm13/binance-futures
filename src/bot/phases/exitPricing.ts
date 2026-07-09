@@ -1,5 +1,7 @@
 import {
   BUILDING_TP_MAX_PCT,
+  BUILDING_TRAIL_FLOOR_PCT,
+  BUILDING_TRAIL_PCT,
   CATASTROPHIC_SL_MULT,
   HARVEST_BREAKEVEN_BUFFER_PCT,
   HARVEST_SL_MAX_PCT,
@@ -23,6 +25,7 @@ export interface ExitPrices {
   dir: 1 | -1;
   mode: ExitMode;
   skipSl?: boolean;
+  skipTp?: boolean;
 }
 
 export interface BuildingSlProjection {
@@ -46,7 +49,31 @@ export interface ExitPriceOptions {
   buildingSlProjection?: BuildingSlProjection;
   /** No SL until every ladder limit is placed (OPEN or FILLED). */
   deferBuildingSl?: boolean;
+  /** Building trail armed after first fill hits activation — trailing SL, no fixed TP. */
+  buildingTrailActive?: boolean;
+  buildingTrailPeakPrice?: number;
+  buildingTrailFloorPct?: number;
+  buildingTrailPct?: number;
   currentPrice?: number;
+}
+
+/**
+ * Trailing SL: never worse than entry ± floorPct, ratcheted from peak favorable price.
+ */
+export function computeTrailingSlPrice(
+  side: 'LONG' | 'SHORT',
+  entry: number,
+  peakPrice: number,
+  tickSize: number,
+  floorPct: number,
+  trailPct: number
+): number {
+  const dir = side === 'LONG' ? 1 : -1;
+  const floor = entry * (1 + dir * floorPct);
+  const peak = peakPrice > 0 ? peakPrice : entry;
+  const trail = peak * (1 - dir * trailPct);
+  const raw = side === 'LONG' ? Math.max(floor, trail) : Math.min(floor, trail);
+  return Math.max(tickSize, roundStep(raw, tickSize));
 }
 
 /**
@@ -61,12 +88,19 @@ export function computeHarvestSlPrice(
   breakevenBufferPct: number = HARVEST_BREAKEVEN_BUFFER_PCT,
   trailPct: number = HARVEST_TRAIL_PCT
 ): number {
-  const dir = side === 'LONG' ? 1 : -1;
-  const breakeven = entry * (1 + dir * breakevenBufferPct);
-  const peak = peakPrice > 0 ? peakPrice : entry;
-  const trail = peak * (1 - dir * trailPct);
-  const raw = side === 'LONG' ? Math.max(breakeven, trail) : Math.min(breakeven, trail);
-  return Math.max(tickSize, roundStep(raw, tickSize));
+  return computeTrailingSlPrice(side, entry, peakPrice, tickSize, breakevenBufferPct, trailPct);
+}
+
+/** Building trail SL with a profit floor (typically BUILDING_TP_MAX_PCT). */
+export function computeBuildingTrailSlPrice(
+  side: 'LONG' | 'SHORT',
+  entry: number,
+  peakPrice: number,
+  tickSize: number,
+  floorPct: number = BUILDING_TRAIL_FLOOR_PCT,
+  trailPct: number = BUILDING_TRAIL_PCT
+): number {
+  return computeTrailingSlPrice(side, entry, peakPrice, tickSize, floorPct, trailPct);
 }
 
 /** Wide backstop SL (max loss = riskAmount × mult at current qty) for when the normal SL is skipped. */
@@ -139,6 +173,17 @@ export function computeExitPrices(
       slPrice = Math.max(tickSize, roundStep(slEntry - dir * slEntry * harvestSlMaxPct, tickSize));
     }
     slDistance = Math.abs(slPrice - slEntry);
+  } else if (options.buildingTrailActive) {
+    tpDistance = tpEntry * buildingTpMaxPct;
+    slPrice = computeBuildingTrailSlPrice(
+      side,
+      slEntry,
+      options.buildingTrailPeakPrice ?? 0,
+      tickSize,
+      options.buildingTrailFloorPct,
+      options.buildingTrailPct
+    );
+    slDistance = Math.abs(slPrice - slEntry);
   } else {
     tpDistance = Math.min(tpDistance, tpEntry * buildingTpMaxPct);
 
@@ -163,7 +208,7 @@ export function computeExitPrices(
   const tpTargetUsd = tpDistance * tpQty;
   const slTargetUsd = harvestMode ? slDistance * tpQty : riskAmount;
 
-  if (options.deferBuildingSl) {
+  if (options.deferBuildingSl && !options.buildingTrailActive) {
     skipSl = true;
   } else if (harvestMode && currentPrice > 0 && wouldSlTriggerNow(side, slPrice, currentPrice, tickSize)) {
     skipSl = true;
@@ -180,5 +225,6 @@ export function computeExitPrices(
     dir,
     mode,
     skipSl,
+    skipTp: options.buildingTrailActive ?? false,
   };
 }

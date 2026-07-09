@@ -51,6 +51,12 @@ import {
 import { isInTradePhase, resolveCyclePhase, botPhaseForLadder } from './phases/types';
 import { isHarvestMode, repairHarvestState } from './phases/harvestMode';
 import { evaluateHarvestTrail } from './phases/harvestTrail';
+import {
+  activateBuildingTrail,
+  canEvaluateBuildingTrail,
+  evaluateBuildingTrail,
+  shouldActivateBuildingTrail,
+} from './phases/buildingTrail';
 
 // ─── Bot Engine (orchestrator) ───────────────────────────────────────────────
 export const botEngine = {
@@ -349,7 +355,7 @@ export const botEngine = {
     }
   },
 
-  // ─── Phase: HARVESTING (partial close + trailing SL on ticks) ──────────────
+  // ─── Phase: BUILDING trail + HARVESTING (partial close + trailing SL on ticks) ─
   onPriceTick(price: number) {
     const now = Date.now();
     if (now - this._lastTickEval < 5_000) return;
@@ -360,6 +366,36 @@ export const botEngine = {
         const changed = await executePartialClose(this.buildHost(), price);
         if (changed) await persistLadderState(this.ladder);
       }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
+      return;
+    }
+
+    if (
+      this.ladder &&
+      !this._refreshingExits &&
+      canEvaluateBuildingTrail(this.ladder) &&
+      shouldActivateBuildingTrail(this.ladder, price)
+    ) {
+      this.runExclusive(async () => {
+        await activateBuildingTrail(this.ladder!, price);
+        await runRefreshExits(this.buildHost());
+        await persistLadderState(this.ladder);
+      }).catch((e) => logger.error('Error activating building trail', { error: e }));
+      return;
+    }
+
+    if (
+      this.ladder &&
+      !this._refreshingExits &&
+      this.ladder.buildingTrailActive &&
+      evaluateBuildingTrail(this.ladder, price, this.tickSize)
+    ) {
+      logger.info(
+        `[Build] Trailing SL update: peak ${this.ladder.buildingPeakPrice}, current SL ${this.ladder.slPrice ?? 'none'}`
+      );
+      this.runExclusive(async () => {
+        await runRefreshExits(this.buildHost());
+        await persistLadderState(this.ladder);
+      }).catch((e) => logger.error('Error updating building trailing SL', { error: e }));
       return;
     }
 

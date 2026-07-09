@@ -1,7 +1,7 @@
 import { client } from './client';
 import { SYMBOL } from './config';
 import { logger } from '../utils/logger';
-import { EntryOrder, LadderState, PositionSnapshot } from './types';
+import { EntryOrder, LadderState, PositionSnapshot, SymbolPrecision } from './types';
 
 export type ExchangeOpenOrder = {
   clientOrderId?: string;
@@ -45,6 +45,44 @@ export async function syncLadderWithExchange(ladder: LadderState): Promise<{
     exchangeEntryCount: countExchangeEntryOrders(openOrders),
     localOpenCount,
   };
+}
+
+/** Tick/step/min filters for a symbol (defaults if the filter is missing). */
+export async function fetchSymbolPrecision(symbol: string): Promise<SymbolPrecision> {
+  const precision: SymbolPrecision = {
+    tickSize: 0.01,
+    stepSize: 0.001,
+    minQty: 0.001,
+    minNotional: 5,
+  };
+  try {
+    const info = await client.getExchangeInfo();
+    const symbolInfo = info.symbols.find((s) => s.symbol === symbol);
+    if (!symbolInfo) {
+      logger.error(`[Exchange] Symbol ${symbol} not found in exchange info`);
+      return precision;
+    }
+    const lot = symbolInfo.filters.find((f) => f.filterType === 'LOT_SIZE') as
+      | { stepSize: string; minQty: string }
+      | undefined;
+    if (lot) {
+      precision.stepSize = parseFloat(lot.stepSize);
+      precision.minQty = parseFloat(lot.minQty);
+    }
+    const price = symbolInfo.filters.find((f) => f.filterType === 'PRICE_FILTER') as
+      | { tickSize: string }
+      | undefined;
+    if (price) precision.tickSize = parseFloat(price.tickSize);
+    const notional = symbolInfo.filters.find((f) => f.filterType === 'MIN_NOTIONAL') as
+      | { notional?: string; minNotional?: string }
+      | undefined;
+    if (notional) {
+      precision.minNotional = parseFloat(notional.notional || notional.minNotional || '5');
+    }
+  } catch (e) {
+    logger.error('[Exchange] Failed to fetch exchange info', { error: e });
+  }
+  return precision;
 }
 
 export async function getAccountBalance(): Promise<number> {

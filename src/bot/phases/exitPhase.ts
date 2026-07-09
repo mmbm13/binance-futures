@@ -136,6 +136,15 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
             ? Math.max(base, currentPrice)
             : Math.min(base, currentPrice)
           : base;
+    } else if (l.buildingTrailActive) {
+      const dir = tradeSide === 'LONG' ? 1 : -1;
+      const base = l.buildingPeakPrice && l.buildingPeakPrice > 0 ? l.buildingPeakPrice : pos.entry;
+      l.buildingPeakPrice =
+        currentPrice > 0
+          ? dir === 1
+            ? Math.max(base, currentPrice)
+            : Math.min(base, currentPrice)
+          : base;
     }
 
     const exitOptions = buildExitPriceOptions(
@@ -154,7 +163,7 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
       TP_REWARD_RATIO,
       exitOptions
     );
-    const { slPrice, tpPrice, tpTargetUsd, closeSide, mode, skipSl } = exits;
+    const { slPrice, tpPrice, tpTargetUsd, closeSide, mode, skipSl, skipTp } = exits;
     const slFromFullLadder = Boolean(exitOptions.buildingSlProjection);
     const deferSl = Boolean(exitOptions.deferBuildingSl);
 
@@ -174,7 +183,10 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
         const slLabel = harvestMode
           ? `harvest SL ${((exits.slDistance / pos.entry) * 100).toFixed(2)}% ` +
             `(breakeven/trail, peak ${l.harvestPeakPrice ?? '?'})`
-          : slFromFullLadder
+          : l.buildingTrailActive
+            ? `building trail SL ${((exits.slDistance / pos.entry) * 100).toFixed(2)}% ` +
+              `(floor/trail, peak ${l.buildingPeakPrice ?? '?'})`
+            : slFromFullLadder
             ? `full ladder max loss $${l.riskAmount.toFixed(2)} beyond deepest rung`
             : `max loss $${l.riskAmount.toFixed(2)} (${((exits.slDistance / pos.entry) * 100).toFixed(2)}%)`;
         logger.info(
@@ -242,23 +254,30 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
       await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'harvest SL would trigger');
     }
 
-    try {
-      const tpRes = await client.submitNewOrder({
-        symbol: SYMBOL,
-        side: closeSide,
-        type: 'LIMIT',
-        price: tpPrice,
-        quantity: pos.qty,
-        timeInForce: 'GTC',
-        reduceOnly: 'true',
-      });
-      l.tpClientOrderId = tpRes.clientOrderId;
+    if (!skipTp) {
+      try {
+        const tpRes = await client.submitNewOrder({
+          symbol: SYMBOL,
+          side: closeSide,
+          type: 'LIMIT',
+          price: tpPrice,
+          quantity: pos.qty,
+          timeInForce: 'GTC',
+          reduceOnly: 'true',
+        });
+        l.tpClientOrderId = tpRes.clientOrderId;
+        logger.info(
+          `[Exit] TP updated (${mode}): ${tradeSide} pos → ${closeSide} LIMIT ${pos.qty} @ ${tpPrice} ` +
+            `(target $${tpTargetUsd.toFixed(2)}, ${((exits.tpDistance / pos.entry) * 100).toFixed(2)}% from entry)`
+        );
+      } catch (e: unknown) {
+        logger.error('[Exit] FAILED to place TP', { error: formatError(e), tpPrice });
+      }
+    } else {
+      l.tpClientOrderId = null;
       logger.info(
-        `[Exit] TP updated (${mode}): ${tradeSide} pos → ${closeSide} LIMIT ${pos.qty} @ ${tpPrice} ` +
-          `(target $${tpTargetUsd.toFixed(2)}, ${((exits.tpDistance / pos.entry) * 100).toFixed(2)}% from entry)`
+        `[Exit] Fixed TP omitted (${mode} trail): trailing SL @ ${slPrice}, peak ${l.buildingPeakPrice ?? '?'}`
       );
-    } catch (e: unknown) {
-      logger.error('[Exit] FAILED to place TP', { error: formatError(e), tpPrice });
     }
   } finally {
     host.setRefreshingExits(false);
@@ -279,6 +298,13 @@ export async function finalizeCycle(host: ExitPhaseHost, exitPrice: number): Pro
       exit_price: exitPrice,
       pnl: finalPnl,
       realized_pnl: finalPnl,
+      strategy: 'ladder',
+      qty: host.ladder?.posQty,
+      fees: host.ladder?.feesPaid ?? 0,
+      meta: {
+        fills: host.ladder?.fills ?? 0,
+        partialCloses: host.ladder?.partialCloses ?? 0,
+      },
     });
     logger.info(`[Exit] Cycle complete. Realized PnL: $${finalPnl.toFixed(2)}`);
   }

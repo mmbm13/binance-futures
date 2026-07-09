@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "test": "npm run test:unit",
-    "test:unit": "node --require ts-node/register --test src/bot/__tests__/*.test.ts",
+    "test:unit": "node --require ts-node/register --test --test-force-exit src/bot/__tests__/*.test.ts",
     "test:connections": "npx ts-node src/test-connections.ts",
     "start": "npx ts-node src/api/server.ts",
     "db:init": "npx ts-node src/db/init.ts",
@@ -12,7 +12,9 @@
     "build": "npx tsc",
     "start:prod": "node dist/api/server.js",
     "test:ws": "npx ts-node src/test-ws.ts",
-    "test:ws:orders": "npx ts-node src/test-ws-orders.ts"
+    "test:ws:orders": "npx ts-node src/test-ws-orders.ts",
+    "paper:all": "bash scripts/run-paper-all.sh",
+    "paper:stop": "bash scripts/stop-paper-all.sh"
 
   },
   "keywords": [],
