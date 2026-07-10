@@ -8,6 +8,7 @@ import {
 import { client } from '../client';
 import { cancelByClientOrderId } from '../exchange';
 import { LadderState } from '../types';
+import { roundStep } from '../math';
 import { computeBuildingTrailSlPrice, wouldSlTriggerNow } from './exitPricing';
 import { logger } from '../../utils/logger';
 
@@ -65,6 +66,20 @@ export async function cancelOpenLadderEntries(ladder: LadderState): Promise<numb
   return canceled;
 }
 
+/**
+ * When price sits on the profit floor, the raw floor SL would be rejected as
+ * "immediately triggering". Nudge it one tick beyond the floor so it arms.
+ */
+export function armBuildingTrailSlAtFloor(
+  side: 'LONG' | 'SHORT',
+  floorSl: number,
+  tickSize: number
+): number {
+  if (floorSl <= 0) return 0;
+  const dir = side === 'LONG' ? 1 : -1;
+  return Math.max(tickSize, roundStep(floorSl - dir * tickSize * 2, tickSize));
+}
+
 /** Arm building trail: cancel pending ladder orders and record the activation peak. */
 export async function activateBuildingTrail(ladder: LadderState, price: number): Promise<void> {
   const side = ladder.side!;
@@ -76,6 +91,16 @@ export async function activateBuildingTrail(ladder: LadderState, price: number):
   logger.info(
     `[Build] Building trail activated at ${price} (peak ${ladder.buildingPeakPrice}, canceled ${canceled} ladder orders)`
   );
+}
+
+/** Activate building trail when price has reached the threshold. Returns true if armed. */
+export async function tryActivateBuildingTrailIfNeeded(
+  ladder: LadderState | null,
+  price: number
+): Promise<boolean> {
+  if (!ladder || !shouldActivateBuildingTrail(ladder, price)) return false;
+  await activateBuildingTrail(ladder, price);
+  return true;
 }
 
 /**

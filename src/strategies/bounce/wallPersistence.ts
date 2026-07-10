@@ -26,24 +26,40 @@ function median(values: number[]): number {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
+function sideVolumes(samples: WallSnapshot[], side: 'bid' | 'ask'): number[] {
+  const vols: number[] = [];
+  for (const s of samples) {
+    const walls = side === 'bid' ? s.buyWalls : s.sellWalls;
+    for (const w of walls) {
+      if (w.volume > 0) vols.push(w.volume);
+    }
+  }
+  return vols;
+}
+
+export interface ZoneBuildDiagnostics {
+  samples: number;
+  side: 'bid' | 'ask';
+  sideMedianVolume: number;
+  minVolume: number;
+  candidates: number;
+  passed: number;
+}
+
 /** Aggregate per-bucket stats across the collection window. */
 export function buildScoredZones(
   samples: WallSnapshot[],
   side: 'bid' | 'ask',
   presenceThreshold: number,
   minVolumeRatio: number,
-  maxZones: number
+  maxZones: number,
+  diagnostics?: ZoneBuildDiagnostics
 ): ScoredZone[] {
   if (samples.length === 0) return [];
 
-  const allVolumes: number[] = [];
-  for (const s of samples) {
-    for (const w of [...s.buyWalls, ...s.sellWalls]) {
-      if (w.volume > 0) allVolumes.push(w.volume);
-    }
-  }
-  const med = median(allVolumes);
-  const minVol = med * minVolumeRatio;
+  const sideVols = sideVolumes(samples, side);
+  const med = median(sideVols);
+  const minVol = med > 0 ? med * minVolumeRatio : 0;
 
   const stats = new Map<number, { count: number; volSum: number }>();
 
@@ -65,11 +81,19 @@ export function buildScoredZones(
 
   const n = samples.length;
   const zones: ScoredZone[] = [];
+  const persistentStats = [...stats.entries()].filter(([, { count }]) => count / n >= presenceThreshold);
+  const maxAvgAmongPersistent = Math.max(
+    0,
+    ...persistentStats.map(([, { count, volSum }]) => volSum / count)
+  );
 
   for (const [price, { count, volSum }] of stats) {
     const presence = count / n;
     const avgVolume = volSum / count;
-    if (presence < presenceThreshold || avgVolume < minVol) continue;
+    const isDominantLeader =
+      presence >= presenceThreshold && avgVolume + 1e-9 >= maxAvgAmongPersistent * 0.95;
+    const passesVolume = avgVolume + 1e-9 >= minVol || isDominantLeader;
+    if (presence < presenceThreshold || !passesVolume) continue;
     zones.push({
       price,
       side,
@@ -79,7 +103,16 @@ export function buildScoredZones(
     });
   }
 
-  return zones.sort((a, b) => b.score - a.score).slice(0, maxZones);
+  const ranked = zones.sort((a, b) => b.score - a.score).slice(0, maxZones);
+  if (diagnostics) {
+    diagnostics.samples = n;
+    diagnostics.side = side;
+    diagnostics.sideMedianVolume = med;
+    diagnostics.minVolume = minVol;
+    diagnostics.candidates = stats.size;
+    diagnostics.passed = ranked.length;
+  }
+  return ranked;
 }
 
 /** Live volume at the zone price must retain at least `retention` of the measured avg. */

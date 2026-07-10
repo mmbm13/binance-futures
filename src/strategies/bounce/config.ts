@@ -9,7 +9,8 @@ export const BOUNCE_WALLS_TO_KEEP = Number(process.env.BOUNCE_WALLS_TO_KEEP || p
 export const BOUNCE_MAX_ZONES_PER_SIDE = Number(process.env.BOUNCE_MAX_ZONES_PER_SIDE || 3);
 
 export const BOUNCE_WALL_PRESENCE = Number(process.env.BOUNCE_WALL_PRESENCE || 0.7);
-export const BOUNCE_WALL_MIN_RATIO = Number(process.env.BOUNCE_WALL_MIN_RATIO || 3);
+/** Min avg volume vs median of same-side walls (3 was too strict on ETH — nothing passed). */
+export const BOUNCE_WALL_MIN_RATIO = Number(process.env.BOUNCE_WALL_MIN_RATIO || 1.5);
 export const BOUNCE_ZONE_TOUCH_PCT = Number(process.env.BOUNCE_ZONE_TOUCH_PCT || 0.001);
 export const BOUNCE_CONFIRM_REBOUND_PCT = Number(process.env.BOUNCE_CONFIRM_REBOUND_PCT || 0.0015);
 export const BOUNCE_CONFIRM_CVD = process.env.BOUNCE_CONFIRM_CVD !== 'false';

@@ -2,14 +2,16 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   activateBuildingTrail,
+  armBuildingTrailSlAtFloor,
   buildingTrailActivationReached,
   buildingTrailFloorBreached,
   canEvaluateBuildingTrail,
   evaluateBuildingTrail,
   isAwaitingBuildingTrail,
   shouldActivateBuildingTrail,
+  tryActivateBuildingTrailIfNeeded,
 } from '../phases/buildingTrail';
-import { computeBuildingTrailSlPrice, computeExitPrices } from '../phases/exitPricing';
+import { computeBuildingTrailSlPrice, computeExitPrices, wouldSlTriggerNow } from '../phases/exitPricing';
 import { makeLadder } from './helpers';
 
 const TICK = 0.01;
@@ -145,6 +147,29 @@ describe('buildingTrailFloorBreached', () => {
     });
     assert.equal(buildingTrailFloorBreached(l, 101.6, TICK), false);
     assert.equal(buildingTrailFloorBreached(l, 101.4, TICK), true);
+  });
+});
+
+describe('armBuildingTrailSlAtFloor', () => {
+  it('nudges LONG floor SL below the profit floor so it can arm', () => {
+    const sl = armBuildingTrailSlAtFloor('LONG', 101.5, TICK);
+    assert.ok(sl < 101.5);
+    assert.equal(wouldSlTriggerNow('LONG', sl, 101.5, TICK), false);
+  });
+
+  it('nudges SHORT floor SL above the profit floor so it can arm', () => {
+    const sl = armBuildingTrailSlAtFloor('SHORT', 98.5, TICK);
+    assert.ok(sl > 98.5);
+    assert.equal(wouldSlTriggerNow('SHORT', sl, 98.5, TICK), false);
+  });
+});
+
+describe('tryActivateBuildingTrailIfNeeded', () => {
+  it('arms trail when threshold is reached', async () => {
+    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.014, entryPrice: 100 });
+    assert.equal(await tryActivateBuildingTrailIfNeeded(l, 101.5), true);
+    assert.equal(l.buildingTrailActive, true);
+    assert.equal(await tryActivateBuildingTrailIfNeeded(l, 102), false);
   });
 });
 

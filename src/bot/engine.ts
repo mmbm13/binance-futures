@@ -58,6 +58,7 @@ import {
   evaluateBuildingTrail,
   executeBuildingTrailFloorClose,
   shouldActivateBuildingTrail,
+  tryActivateBuildingTrailIfNeeded,
 } from './phases/buildingTrail';
 
 // ─── Bot Engine (orchestrator) ───────────────────────────────────────────────
@@ -70,7 +71,7 @@ export const botEngine = {
   minNotional: 5,
   initialized: false,
   _collectTimer: null as NodeJS.Timeout | null,
-  _lastTickEval: 0,
+  _lastTrailEval: 0,
   _refreshingExits: false,
   _partialCloseInFlight: false,
   _chain: Promise.resolve() as Promise<unknown>,
@@ -281,6 +282,9 @@ export const botEngine = {
             } else {
               await handleSubsequentFill(ladder, entry, placeLadder);
             }
+            if (await tryActivateBuildingTrailIfNeeded(ladder, tickPrice)) {
+              logger.info(`[Build] Trail armed on fill tick @ ${tickPrice}`);
+            }
             await runRefreshExits(host);
           } else if (!partialDone) {
             await runRefreshExits(host);
@@ -359,14 +363,45 @@ export const botEngine = {
 
   // ─── Phase: BUILDING trail + HARVESTING (partial close + trailing SL on ticks) ─
   onPriceTick(price: number) {
+    if (price <= 0) return;
+
+    // Activation is checked on every tick — a 5s throttle here caused missed arming at +1.5%.
+    if (
+      this.ladder &&
+      !this._refreshingExits &&
+      canEvaluateBuildingTrail(this.ladder) &&
+      shouldActivateBuildingTrail(this.ladder, price)
+    ) {
+      this.runExclusive(async () => {
+        await activateBuildingTrail(this.ladder!, price);
+        await runRefreshExits(this.buildHost());
+        await persistLadderState(this.ladder);
+      }).catch((e) => logger.error('Error activating building trail', { error: e }));
+      return;
+    }
+
     const now = Date.now();
-    if (now - this._lastTickEval < 5_000) return;
-    this._lastTickEval = now;
+    if (now - this._lastTrailEval < 5_000) return;
+    this._lastTrailEval = now;
 
     if (canEvaluatePartialClose(this.ladder)) {
       this.runExclusive(async () => {
         const changed = await executePartialClose(this.buildHost(), price);
-        if (changed) await persistLadderState(this.ladder);
+        if (changed) {
+          await persistLadderState(this.ladder);
+          return;
+        }
+        if (
+          this.ladder &&
+          !this._refreshingExits &&
+          evaluateHarvestTrail(this.ladder, price, this.tickSize)
+        ) {
+          logger.info(
+            `[Harvest] Trailing SL update: peak ${this.ladder.harvestPeakPrice}, current SL ${this.ladder.slPrice ?? 'none'}`
+          );
+          await runRefreshExits(this.buildHost());
+          await persistLadderState(this.ladder);
+        }
       }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
       return;
     }
@@ -380,20 +415,6 @@ export const botEngine = {
       this.runExclusive(async () => {
         await executeBuildingTrailFloorClose(this.ladder!, price, this.tickSize);
       }).catch((e) => logger.error('Error on building trail floor close', { error: e }));
-      return;
-    }
-
-    if (
-      this.ladder &&
-      !this._refreshingExits &&
-      canEvaluateBuildingTrail(this.ladder) &&
-      shouldActivateBuildingTrail(this.ladder, price)
-    ) {
-      this.runExclusive(async () => {
-        await activateBuildingTrail(this.ladder!, price);
-        await runRefreshExits(this.buildHost());
-        await persistLadderState(this.ladder);
-      }).catch((e) => logger.error('Error activating building trail', { error: e }));
       return;
     }
 

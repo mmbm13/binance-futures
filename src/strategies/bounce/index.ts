@@ -55,6 +55,7 @@ import {
   liveVolumeAtZone,
   ScoredZone,
   WallSnapshot,
+  ZoneBuildDiagnostics,
   zoneVolumeRetained,
 } from './wallPersistence';
 
@@ -194,7 +195,11 @@ export class BounceStrategy implements Strategy {
         await this.ensureStop();
         return;
       }
-      if (this.state.phase === 'ZONES_READY' || this.state.phase === 'SETUP') return;
+      if (this.state.phase === 'SETUP') return;
+      if (this.state.phase === 'ZONES_READY' && this.hasTradeableZones()) return;
+      if (this.state.phase === 'ZONES_READY') {
+        logger.warn('[Bounce] ZONES_READY with empty zones — restarting collection');
+      }
       await this.startCollectCycle();
     });
   }
@@ -336,6 +341,10 @@ export class BounceStrategy implements Strategy {
     });
   }
 
+  private hasTradeableZones(): boolean {
+    return this.state.bidZones.length > 0 || this.state.askZones.length > 0;
+  }
+
   private async finishCollect(): Promise<void> {
     this.clearCollectTimers();
     if (this.snapshots.length < 3) {
@@ -344,26 +353,60 @@ export class BounceStrategy implements Strategy {
       return;
     }
 
+    const bidDiag: ZoneBuildDiagnostics = {
+      samples: 0,
+      side: 'bid',
+      sideMedianVolume: 0,
+      minVolume: 0,
+      candidates: 0,
+      passed: 0,
+    };
+    const askDiag: ZoneBuildDiagnostics = {
+      samples: 0,
+      side: 'ask',
+      sideMedianVolume: 0,
+      minVolume: 0,
+      candidates: 0,
+      passed: 0,
+    };
+
     this.state.bidZones = buildScoredZones(
       this.snapshots,
       'bid',
       BOUNCE_WALL_PRESENCE,
       BOUNCE_WALL_MIN_RATIO,
-      BOUNCE_MAX_ZONES_PER_SIDE
+      BOUNCE_MAX_ZONES_PER_SIDE,
+      bidDiag
     );
     this.state.askZones = buildScoredZones(
       this.snapshots,
       'ask',
       BOUNCE_WALL_PRESENCE,
       BOUNCE_WALL_MIN_RATIO,
-      BOUNCE_MAX_ZONES_PER_SIDE
+      BOUNCE_MAX_ZONES_PER_SIDE,
+      askDiag
     );
+
+    if (!this.hasTradeableZones()) {
+      logger.warn('[Bounce] No zones passed filters — restarting collect', {
+        samples: this.snapshots.length,
+        presenceMin: BOUNCE_WALL_PRESENCE,
+        volumeRatioMin: BOUNCE_WALL_MIN_RATIO,
+        bid: bidDiag,
+        ask: askDiag,
+      });
+      await this.startCollectCycle();
+      return;
+    }
+
     this.state.phase = 'ZONES_READY';
     this.snapshots = [];
 
     logger.info('[Bounce] Zones ready', {
       bid: this.state.bidZones.map((z) => z.price),
       ask: this.state.askZones.map((z) => z.price),
+      bidDiag,
+      askDiag,
     });
     await recordSignal('bounce', SYMBOL, 'zones_ready', {
       bid: this.state.bidZones,

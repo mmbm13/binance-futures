@@ -9,6 +9,7 @@ import { countFilledOnSide, countOpenOnSide, effectiveLadderLevels } from '../la
 import { activeEntrySide } from '../ladder/spacing';
 import { buildExitPriceOptions } from './exitPricingContext';
 import { computeCatastrophicSlPrice, computeExitPrices, wouldSlTriggerNow } from './exitPricing';
+import { armBuildingTrailSlAtFloor, tryActivateBuildingTrailIfNeeded } from './buildingTrail';
 import { isHarvestMode, repairHarvestState } from './harvestMode';
 import { botPhaseForLadder } from './types';
 import { logger } from '../../utils/logger';
@@ -127,6 +128,10 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
       } catch { /* bookTicker will catch up */ }
     }
 
+    if (await tryActivateBuildingTrailIfNeeded(l, currentPrice)) {
+      logger.info(`[Build] Trail armed during exit refresh @ ${currentPrice}`);
+    }
+
     if (harvestMode) {
       const dir = tradeSide === 'LONG' ? 1 : -1;
       const base = l.harvestPeakPrice && l.harvestPeakPrice > 0 ? l.harvestPeakPrice : pos.entry;
@@ -235,10 +240,53 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
         }
       }
     } else if (l.buildingTrailActive && skipSl) {
-      logger.info(
-        `[Exit] Building trail SL deferred at floor ${slPrice} (price ${currentPrice}) — catastrophic backstop until extension`
-      );
-      await placeCatastrophicSl(l, pos, closeSide, currentPrice, host.precision.tickSize, 'building trail SL deferred at floor');
+      const armableSl = armBuildingTrailSlAtFloor(tradeSide, slPrice, host.precision.tickSize);
+      if (
+        armableSl > 0 &&
+        !wouldSlTriggerNow(tradeSide, armableSl, currentPrice, host.precision.tickSize)
+      ) {
+        try {
+          logger.info(
+            `[Exit] Building trail SL at floor ${slPrice} nudged to ${armableSl} (price ${currentPrice})`
+          );
+          const slRes = await client.submitNewAlgoOrder({
+            algoType: 'CONDITIONAL',
+            symbol: SYMBOL,
+            side: closeSide,
+            type: 'STOP_MARKET',
+            triggerPrice: armableSl,
+            closePosition: 'true',
+          });
+          l.slAlgoId = Number(slRes.algoId);
+          l.slPrice = armableSl;
+          l.slIsCatastrophic = false;
+          logger.info(`[Exit] Building trail floor SL placed: ${closeSide} STOP_MARKET @ ${armableSl}`);
+        } catch (e: unknown) {
+          logger.warn('[Exit] Building trail floor SL rejected — catastrophic backstop until extension', {
+            error: formatError(e),
+          });
+          await placeCatastrophicSl(
+            l,
+            pos,
+            closeSide,
+            currentPrice,
+            host.precision.tickSize,
+            'building trail floor SL rejected'
+          );
+        }
+      } else {
+        logger.info(
+          `[Exit] Building trail SL deferred at floor ${slPrice} (price ${currentPrice}) — catastrophic backstop until extension`
+        );
+        await placeCatastrophicSl(
+          l,
+          pos,
+          closeSide,
+          currentPrice,
+          host.precision.tickSize,
+          'building trail SL deferred at floor'
+        );
+      }
     } else if (deferSl) {
       const entrySide = l.side ? activeEntrySide(l.side) : null;
       const placed = entrySide ? countFilledOnSide(l, entrySide) + countOpenOnSide(l, entrySide) : 0;

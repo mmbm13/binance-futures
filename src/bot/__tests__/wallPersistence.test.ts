@@ -31,9 +31,18 @@ describe('buildScoredZones', () => {
       ...Array.from({ length: 9 }, (_, i) => sample(i, 2000, [[1980, 100]], [])),
       sample(9, 2000, [[1980, 100], [1970, 200]], []),
     ];
-    const bid = buildScoredZones(samples, 'bid', 0.7, 1, 3);
+    const bid = buildScoredZones(samples, 'bid', 0.7, 1.5, 3);
     assert.equal(bid.some((z) => z.price === 1970), false);
     assert.equal(bid.some((z) => z.price === 1980), true);
+  });
+
+  it('uses same-side median so ask walls are not blocked by bid volumes', () => {
+    const samples = Array.from({ length: 10 }, (_, i) =>
+      sample(i, 1740, [[1730, 12_000], [1740, 300]], [[1750, 9_000]])
+    );
+    const ask = buildScoredZones(samples, 'ask', 0.7, 1.5, 3);
+    assert.equal(ask.length, 1);
+    assert.equal(ask[0].price, 1750);
   });
 
   it('respects maxZones cap', () => {

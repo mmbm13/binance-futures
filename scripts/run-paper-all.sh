@@ -10,6 +10,9 @@ PID_FILE="$ROOT/.paper-bots.pids"
 LOG_DIR="$ROOT/logs/paper"
 mkdir -p "$LOG_DIR"
 
+# shellcheck source=paper-pids.sh
+source "$ROOT/scripts/paper-pids.sh"
+
 BOTS=(
   "momentum:3002"
   "bounce:3003"
@@ -29,18 +32,10 @@ for entry in "${BOTS[@]}"; do
   fi
 done
 
-# Stop previous paper fleet if pid file exists
-if [[ -f "$PID_FILE" ]]; then
-  echo "Stopping previous paper bots from $PID_FILE ..."
-  while read -r pid name; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      echo "  stopped $name (pid $pid)"
-    fi
-  done < "$PID_FILE"
-  rm -f "$PID_FILE"
-  sleep 2
-fi
+# Stop previous paper fleet (by pid file + listening ports)
+echo "Stopping previous paper bots (if any)..."
+paper_stop_all "$PID_FILE"
+sleep 1
 
 # Global RUNNING so evaluation loops work across processes
 if command -v psql >/dev/null 2>&1 && [[ -n "${DATABASE_URL:-}" || -f .env ]]; then
@@ -60,9 +55,7 @@ for entry in "${BOTS[@]}"; do
   port="${entry##*:}"
   log="$LOG_DIR/$id.log"
   STRATEGY="$id" EXECUTION_MODE=paper PORT="$port" npm start >>"$log" 2>&1 &
-  pid=$!
-  echo "$pid $id" >> "$PID_FILE"
-  echo "  $id → pid $pid, port $port, log $log"
+  echo "  $id → launching on port $port, log $log"
 done
 
 echo "Waiting for HTTP ports..."
@@ -79,6 +72,13 @@ for entry in "${BOTS[@]}"; do
     echo "Error: $id did not become ready on port $port — check $LOG_DIR/$id.log"
     exit 1
   fi
+  listen_pid="$(paper_listen_pid "$port")"
+  if [[ -z "$listen_pid" ]]; then
+    echo "Error: $id is up on :$port but could not resolve listen pid (install lsof)"
+    exit 1
+  fi
+  echo "$listen_pid $id $port" >> "$PID_FILE"
+  echo "  $id → pid $listen_pid, port $port"
 done
 
 echo "Sending POST /start to each bot..."
