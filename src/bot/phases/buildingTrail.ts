@@ -2,7 +2,6 @@ import {
   BUILDING_TRAIL_ACTIVATION_PCT,
   BUILDING_TRAIL_ENABLED,
   BUILDING_TRAIL_FLOOR_PCT,
-  BUILDING_TRAIL_KLINE_LOOKBACK,
   BUILDING_TRAIL_MIN_STEP_PCT,
   SYMBOL,
 } from '../config';
@@ -126,39 +125,6 @@ export async function tryActivateBuildingTrailIfNeeded(
   const activationPrice = ladder.buildingPeakPrice ?? price;
   await activateBuildingTrail(ladder, activationPrice);
   return true;
-}
-
-/**
- * Backfill the awaiting-trail peak from recent 1m klines so a fast spike is not
- * lost when bookTicker ticks were missed or the process restarted.
- */
-export async function recoverAwaitingTrailPeakFromKlines(
-  ladder: LadderState,
-  lookback: number = BUILDING_TRAIL_KLINE_LOOKBACK
-): Promise<number | null> {
-  if (!isAwaitingBuildingTrail(ladder) || !ladder.side || lookback <= 0) return null;
-
-  try {
-    const raw = await client.getKlines({ symbol: SYMBOL, interval: '1m', limit: lookback });
-    const before = ladder.buildingPeakPrice ?? ladder.entryPrice;
-    for (const k of raw) {
-      const extreme = ladder.side === 'LONG' ? Number(k[2]) : Number(k[3]);
-      if (Number.isFinite(extreme) && extreme > 0) {
-        ratchetAwaitingTrailPeak(ladder, extreme);
-      }
-    }
-    const after = ladder.buildingPeakPrice ?? before;
-    if (after !== before) {
-      logger.info(
-        `[Build] Recovered awaiting-trail peak from klines: ${before.toFixed(2)} → ${after.toFixed(2)} (${lookback}×1m)`
-      );
-    }
-    return after;
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    logger.warn('[Build] Could not recover awaiting-trail peak from klines', { error: msg });
-    return null;
-  }
 }
 
 export function logAwaitingTrailStatus(ladder: LadderState, price: number): void {

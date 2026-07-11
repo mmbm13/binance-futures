@@ -14,7 +14,6 @@ import {
   isAwaitingBuildingTrail,
   logAwaitingTrailStatus,
   ratchetAwaitingTrailPeak,
-  recoverAwaitingTrailPeakFromKlines,
   tryActivateBuildingTrailIfNeeded,
 } from './buildingTrail';
 import { isHarvestMode, repairHarvestState } from './harvestMode';
@@ -135,15 +134,12 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
       } catch { /* bookTicker will catch up */ }
     }
 
-    if (await tryActivateBuildingTrailIfNeeded(l, currentPrice)) {
-      logger.info(`[Build] Trail armed during exit refresh @ ${currentPrice}`);
-    } else if (isAwaitingBuildingTrail(l)) {
-      await recoverAwaitingTrailPeakFromKlines(l);
+    if (isAwaitingBuildingTrail(l) && currentPrice > 0) {
       ratchetAwaitingTrailPeak(l, currentPrice);
       logAwaitingTrailStatus(l, currentPrice);
-      if (await tryActivateBuildingTrailIfNeeded(l, currentPrice)) {
-        logger.info(`[Build] Trail armed after kline peak recovery @ ${currentPrice}`);
-      }
+    }
+    if (await tryActivateBuildingTrailIfNeeded(l, currentPrice)) {
+      logger.info(`[Build] Trail armed during exit refresh @ ${currentPrice}`);
     }
 
     if (harvestMode) {

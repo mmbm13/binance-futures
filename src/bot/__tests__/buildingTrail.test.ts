@@ -11,11 +11,9 @@ import {
   isAwaitingBuildingTrail,
   shouldActivateBuildingTrail,
   ratchetAwaitingTrailPeak,
-  recoverAwaitingTrailPeakFromKlines,
   tryActivateBuildingTrailIfNeeded,
 } from '../phases/buildingTrail';
 import { computeBuildingTrailSlPrice, computeExitPrices, wouldSlTriggerNow } from '../phases/exitPricing';
-import { client } from '../client';
 import { makeLadder } from './helpers';
 
 const TICK = 0.01;
@@ -187,27 +185,6 @@ describe('armBuildingTrailSlAtFloor', () => {
     const sl = armBuildingTrailSlAtFloor('SHORT', 98.5, TICK);
     assert.ok(sl > 98.5);
     assert.equal(wouldSlTriggerNow('SHORT', sl, 98.5, TICK), false);
-  });
-});
-
-describe('recoverAwaitingTrailPeakFromKlines', () => {
-  it('ratchets peak from 1m highs while awaiting LONG trail', async () => {
-    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.016, entryPrice: 1780 });
-    const originalGetKlines = client.getKlines;
-    client.getKlines = async () =>
-      [
-        [0, '0', 1800, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, '0', 1811, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, '0', 1795, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-      ] as Awaited<ReturnType<typeof client.getKlines>>;
-
-    try {
-      await recoverAwaitingTrailPeakFromKlines(l, 3);
-      assert.equal(l.buildingPeakPrice, 1811);
-      assert.equal(shouldActivateBuildingTrail(l, 1790), true);
-    } finally {
-      client.getKlines = originalGetKlines;
-    }
   });
 });
 
