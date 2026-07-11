@@ -3,15 +3,19 @@ import assert from 'node:assert/strict';
 import {
   activateBuildingTrail,
   armBuildingTrailSlAtFloor,
+  awaitingTrailGivebackBreached,
   buildingTrailActivationReached,
   buildingTrailFloorBreached,
   canEvaluateBuildingTrail,
   evaluateBuildingTrail,
   isAwaitingBuildingTrail,
   shouldActivateBuildingTrail,
+  ratchetAwaitingTrailPeak,
+  recoverAwaitingTrailPeakFromKlines,
   tryActivateBuildingTrailIfNeeded,
 } from '../phases/buildingTrail';
 import { computeBuildingTrailSlPrice, computeExitPrices, wouldSlTriggerNow } from '../phases/exitPricing';
+import { client } from '../client';
 import { makeLadder } from './helpers';
 
 const TICK = 0.01;
@@ -47,6 +51,13 @@ describe('shouldActivateBuildingTrail', () => {
     assert.equal(shouldActivateBuildingTrail(l, 101.5), true);
     l.buildingTrailActive = true;
     assert.equal(shouldActivateBuildingTrail(l, 102), false);
+  });
+
+  it('arms on retracement after peak already reached activation', () => {
+    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.014, entryPrice: 100 });
+    ratchetAwaitingTrailPeak(l, 102);
+    assert.equal(l.buildingPeakPrice, 102);
+    assert.equal(shouldActivateBuildingTrail(l, 101.2), true);
   });
 });
 
@@ -150,6 +161,21 @@ describe('buildingTrailFloorBreached', () => {
   });
 });
 
+describe('awaitingTrailGivebackBreached', () => {
+  it('closes when peak hit activation but price gives back through the floor', () => {
+    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.014, entryPrice: 100 });
+    l.buildingPeakPrice = 102;
+    assert.equal(awaitingTrailGivebackBreached(l, 101.6, TICK), false);
+    assert.equal(awaitingTrailGivebackBreached(l, 101.4, TICK), true);
+  });
+
+  it('does not trigger before peak reached activation', () => {
+    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.014, entryPrice: 100 });
+    l.buildingPeakPrice = 101.2;
+    assert.equal(awaitingTrailGivebackBreached(l, 101.4, TICK), false);
+  });
+});
+
 describe('armBuildingTrailSlAtFloor', () => {
   it('nudges LONG floor SL below the profit floor so it can arm', () => {
     const sl = armBuildingTrailSlAtFloor('LONG', 101.5, TICK);
@@ -161,6 +187,27 @@ describe('armBuildingTrailSlAtFloor', () => {
     const sl = armBuildingTrailSlAtFloor('SHORT', 98.5, TICK);
     assert.ok(sl > 98.5);
     assert.equal(wouldSlTriggerNow('SHORT', sl, 98.5, TICK), false);
+  });
+});
+
+describe('recoverAwaitingTrailPeakFromKlines', () => {
+  it('ratchets peak from 1m highs while awaiting LONG trail', async () => {
+    const l = makeLadder({ side: 'LONG', fills: 1, posQty: 0.016, entryPrice: 1780 });
+    const originalGetKlines = client.getKlines;
+    client.getKlines = async () =>
+      [
+        [0, '0', 1800, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, '0', 1811, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0, '0', 1795, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      ] as Awaited<ReturnType<typeof client.getKlines>>;
+
+    try {
+      await recoverAwaitingTrailPeakFromKlines(l, 3);
+      assert.equal(l.buildingPeakPrice, 1811);
+      assert.equal(shouldActivateBuildingTrail(l, 1790), true);
+    } finally {
+      client.getKlines = originalGetKlines;
+    }
   });
 });
 

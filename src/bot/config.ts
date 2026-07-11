@@ -39,6 +39,10 @@ export const BUILDING_TRAIL_PCT = Number(process.env.BUILDING_TRAIL_PCT || HARVE
 export const BUILDING_TRAIL_MIN_STEP_PCT = Number(
   process.env.BUILDING_TRAIL_MIN_STEP_PCT || HARVEST_TRAIL_MIN_STEP_PCT
 );
+/** Min ms between trail ratchet / partial-close evaluations (activation uses every WS tick). */
+export const TRAIL_EVAL_INTERVAL_MS = Number(process.env.TRAIL_EVAL_INTERVAL_MS || 1_000);
+/** 1m candles scanned to recover a missed favorable peak while awaiting trail. */
+export const BUILDING_TRAIL_KLINE_LOOKBACK = Number(process.env.BUILDING_TRAIL_KLINE_LOOKBACK || 180);
 /** Catastrophic backstop SL distance as multiple of riskAmount (always on exchange when normal SL is skipped). */
 export const CATASTROPHIC_SL_MULT = Number(process.env.CATASTROPHIC_SL_MULT || 2.0);
 /** Min net profit as fraction of cycle risk (riskAmount) before partial close. */

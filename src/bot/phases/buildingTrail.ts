@@ -2,6 +2,7 @@ import {
   BUILDING_TRAIL_ACTIVATION_PCT,
   BUILDING_TRAIL_ENABLED,
   BUILDING_TRAIL_FLOOR_PCT,
+  BUILDING_TRAIL_KLINE_LOOKBACK,
   BUILDING_TRAIL_MIN_STEP_PCT,
   SYMBOL,
 } from '../config';
@@ -43,12 +44,35 @@ export function buildingTrailActivationReached(
   return dir === 1 ? price >= threshold : price <= threshold;
 }
 
-export function shouldActivateBuildingTrail(ladder: LadderState, price: number): boolean {
-  return (
-    canEvaluateBuildingTrail(ladder) &&
-    !ladder.buildingTrailActive &&
-    buildingTrailActivationReached(ladder.side!, ladder.entryPrice, price)
+/** True when building trail is armed and the position should be managed by trail logic. */
+export function canManageBuildingTrail(ladder: LadderState | null): boolean {
+  if (!BUILDING_TRAIL_ENABLED) return false;
+  return Boolean(
+    ladder?.buildingTrailActive &&
+      ladder.side &&
+      ladder.partialCloses === 0 &&
+      !ladder.windingDown &&
+      ladder.posQty > 0 &&
+      ladder.entryPrice > 0
   );
+}
+
+/** Ratchet the best favorable price seen while awaiting trail activation. */
+export function ratchetAwaitingTrailPeak(ladder: LadderState, price: number): void {
+  if (!isAwaitingBuildingTrail(ladder) || !ladder.side || price <= 0) return;
+  const dir = ladder.side === 'LONG' ? 1 : -1;
+  const base =
+    ladder.buildingPeakPrice && ladder.buildingPeakPrice > 0
+      ? ladder.buildingPeakPrice
+      : ladder.entryPrice;
+  ladder.buildingPeakPrice = dir === 1 ? Math.max(base, price) : Math.min(base, price);
+}
+
+export function shouldActivateBuildingTrail(ladder: LadderState, price: number): boolean {
+  if (!canEvaluateBuildingTrail(ladder) || ladder.buildingTrailActive) return false;
+  ratchetAwaitingTrailPeak(ladder, price);
+  const peak = ladder.buildingPeakPrice ?? price;
+  return buildingTrailActivationReached(ladder.side!, ladder.entryPrice, peak);
 }
 
 export async function cancelOpenLadderEntries(ladder: LadderState): Promise<number> {
@@ -99,8 +123,53 @@ export async function tryActivateBuildingTrailIfNeeded(
   price: number
 ): Promise<boolean> {
   if (!ladder || !shouldActivateBuildingTrail(ladder, price)) return false;
-  await activateBuildingTrail(ladder, price);
+  const activationPrice = ladder.buildingPeakPrice ?? price;
+  await activateBuildingTrail(ladder, activationPrice);
   return true;
+}
+
+/**
+ * Backfill the awaiting-trail peak from recent 1m klines so a fast spike is not
+ * lost when bookTicker ticks were missed or the process restarted.
+ */
+export async function recoverAwaitingTrailPeakFromKlines(
+  ladder: LadderState,
+  lookback: number = BUILDING_TRAIL_KLINE_LOOKBACK
+): Promise<number | null> {
+  if (!isAwaitingBuildingTrail(ladder) || !ladder.side || lookback <= 0) return null;
+
+  try {
+    const raw = await client.getKlines({ symbol: SYMBOL, interval: '1m', limit: lookback });
+    const before = ladder.buildingPeakPrice ?? ladder.entryPrice;
+    for (const k of raw) {
+      const extreme = ladder.side === 'LONG' ? Number(k[2]) : Number(k[3]);
+      if (Number.isFinite(extreme) && extreme > 0) {
+        ratchetAwaitingTrailPeak(ladder, extreme);
+      }
+    }
+    const after = ladder.buildingPeakPrice ?? before;
+    if (after !== before) {
+      logger.info(
+        `[Build] Recovered awaiting-trail peak from klines: ${before.toFixed(2)} → ${after.toFixed(2)} (${lookback}×1m)`
+      );
+    }
+    return after;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn('[Build] Could not recover awaiting-trail peak from klines', { error: msg });
+    return null;
+  }
+}
+
+export function logAwaitingTrailStatus(ladder: LadderState, price: number): void {
+  if (!isAwaitingBuildingTrail(ladder) || !ladder.side || price <= 0) return;
+  const dir = ladder.side === 'LONG' ? 1 : -1;
+  const threshold = ladder.entryPrice * (1 + dir * BUILDING_TRAIL_ACTIVATION_PCT);
+  const peak = ladder.buildingPeakPrice ?? ladder.entryPrice;
+  logger.info(
+    `[Build] Awaiting trail: ${ladder.side} entry ${ladder.entryPrice.toFixed(2)}, ` +
+      `mark ${price.toFixed(2)}, peak ${peak.toFixed(2)}, activate @ ${threshold.toFixed(2)}`
+  );
 }
 
 /**
@@ -113,7 +182,7 @@ export function evaluateBuildingTrail(
   tickSize: number,
   minStepPct: number = BUILDING_TRAIL_MIN_STEP_PCT
 ): boolean {
-  if (!ladder.buildingTrailActive || !canEvaluateBuildingTrail(ladder) || price <= 0) {
+  if (!ladder.buildingTrailActive || !canManageBuildingTrail(ladder) || price <= 0) {
     return false;
   }
 
@@ -161,6 +230,54 @@ export function buildingTrailFloorBreached(
   if (!ladder.slIsCatastrophic && ladder.slPrice && ladder.slPrice > 0) return false;
   const floor = buildingTrailFloorPrice(ladder.side, ladder.entryPrice, floorPct);
   return wouldSlTriggerNow(ladder.side, floor, price, tickSize);
+}
+
+/**
+ * Spike protection while awaiting trail: peak once reached activation but SL never
+ * armed (missed tick, refresh failure) — close at market if price gives back the floor.
+ */
+export function awaitingTrailGivebackBreached(
+  ladder: LadderState,
+  price: number,
+  tickSize: number,
+  floorPct: number = BUILDING_TRAIL_FLOOR_PCT
+): boolean {
+  if (!isAwaitingBuildingTrail(ladder) || !ladder.side || price <= 0) return false;
+  const peak = ladder.buildingPeakPrice ?? 0;
+  if (peak <= 0) return false;
+  if (!buildingTrailActivationReached(ladder.side, ladder.entryPrice, peak)) return false;
+  const floor = buildingTrailFloorPrice(ladder.side, ladder.entryPrice, floorPct);
+  return wouldSlTriggerNow(ladder.side, floor, price, tickSize);
+}
+
+/** Market close when awaiting trail after a missed activation and floor giveback. */
+export async function executeAwaitingTrailGivebackClose(
+  ladder: LadderState,
+  price: number,
+  tickSize: number = 0.01
+): Promise<boolean> {
+  if (!awaitingTrailGivebackBreached(ladder, price, tickSize)) return false;
+
+  const closeSide = ladder.side === 'LONG' ? 'SELL' : 'BUY';
+  const peak = ladder.buildingPeakPrice ?? price;
+  logger.warn(
+    `[Build] Awaiting-trail giveback @ ${price} (peak ${peak}, floor ${buildingTrailFloorPrice(ladder.side!, ladder.entryPrice).toFixed(4)}) — closing at market`
+  );
+
+  try {
+    await client.submitNewOrder({
+      symbol: SYMBOL,
+      side: closeSide,
+      type: 'MARKET',
+      quantity: ladder.posQty,
+      reduceOnly: 'true',
+    });
+    return true;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.error('[Build] Awaiting-trail giveback close failed', { error: msg });
+    return false;
+  }
 }
 
 /** Market close when floor is breached before the trailing SL could be placed. */

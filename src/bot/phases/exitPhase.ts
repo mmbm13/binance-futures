@@ -9,7 +9,14 @@ import { countFilledOnSide, countOpenOnSide, effectiveLadderLevels } from '../la
 import { activeEntrySide } from '../ladder/spacing';
 import { buildExitPriceOptions } from './exitPricingContext';
 import { computeCatastrophicSlPrice, computeExitPrices, wouldSlTriggerNow } from './exitPricing';
-import { armBuildingTrailSlAtFloor, tryActivateBuildingTrailIfNeeded } from './buildingTrail';
+import {
+  armBuildingTrailSlAtFloor,
+  isAwaitingBuildingTrail,
+  logAwaitingTrailStatus,
+  ratchetAwaitingTrailPeak,
+  recoverAwaitingTrailPeakFromKlines,
+  tryActivateBuildingTrailIfNeeded,
+} from './buildingTrail';
 import { isHarvestMode, repairHarvestState } from './harvestMode';
 import { botPhaseForLadder } from './types';
 import { logger } from '../../utils/logger';
@@ -130,6 +137,13 @@ export async function refreshExits(host: ExitPhaseHost): Promise<void> {
 
     if (await tryActivateBuildingTrailIfNeeded(l, currentPrice)) {
       logger.info(`[Build] Trail armed during exit refresh @ ${currentPrice}`);
+    } else if (isAwaitingBuildingTrail(l)) {
+      await recoverAwaitingTrailPeakFromKlines(l);
+      ratchetAwaitingTrailPeak(l, currentPrice);
+      logAwaitingTrailStatus(l, currentPrice);
+      if (await tryActivateBuildingTrailIfNeeded(l, currentPrice)) {
+        logger.info(`[Build] Trail armed after kline peak recovery @ ${currentPrice}`);
+      }
     }
 
     if (harvestMode) {

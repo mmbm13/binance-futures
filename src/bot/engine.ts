@@ -15,6 +15,7 @@ import {
   MIN_LADDER_SPACING_PCT,
   MAX_LADDER_SPACING_PCT,
   MAKER_FEE,
+  TRAIL_EVAL_INTERVAL_MS,
 } from './config';
 import { LadderState, SymbolPrecision } from './types';
 import { sleep } from './math';
@@ -53,10 +54,14 @@ import { isHarvestMode, repairHarvestState } from './phases/harvestMode';
 import { evaluateHarvestTrail } from './phases/harvestTrail';
 import {
   activateBuildingTrail,
+  awaitingTrailGivebackBreached,
   buildingTrailFloorBreached,
   canEvaluateBuildingTrail,
   evaluateBuildingTrail,
+  executeAwaitingTrailGivebackClose,
   executeBuildingTrailFloorClose,
+  isAwaitingBuildingTrail,
+  ratchetAwaitingTrailPeak,
   shouldActivateBuildingTrail,
   tryActivateBuildingTrailIfNeeded,
 } from './phases/buildingTrail';
@@ -279,6 +284,7 @@ export const botEngine = {
             const placeLadder = () => runPlaceLadderOrders(host);
             if (isFirstFill) {
               await handleFirstFill(ladder, entry, fillPrice, placeLadder);
+              this.ensurePriceWatch();
             } else {
               await handleSubsequentFill(ladder, entry, placeLadder);
             }
@@ -361,27 +367,51 @@ export const botEngine = {
     }
   },
 
+  ensurePriceWatch() {
+    orderBookCollector.onPrice = (p) => this.onPriceTick(p);
+    orderBookCollector.startPriceStream(SYMBOL);
+  },
+
   // ─── Phase: BUILDING trail + HARVESTING (partial close + trailing SL on ticks) ─
   onPriceTick(price: number) {
     if (price <= 0) return;
 
-    // Activation is checked on every tick — a 5s throttle here caused missed arming at +1.5%.
-    if (
-      this.ladder &&
-      !this._refreshingExits &&
-      canEvaluateBuildingTrail(this.ladder) &&
-      shouldActivateBuildingTrail(this.ladder, price)
-    ) {
+    if (this.ladder && isAwaitingBuildingTrail(this.ladder)) {
+      ratchetAwaitingTrailPeak(this.ladder, price);
+    }
+
+    // Activation uses every WS tick (peak-based — survives fast spike + retrace).
+    if (this.ladder && canEvaluateBuildingTrail(this.ladder) && shouldActivateBuildingTrail(this.ladder, price)) {
       this.runExclusive(async () => {
-        await activateBuildingTrail(this.ladder!, price);
+        const activationPrice = this.ladder!.buildingPeakPrice ?? price;
+        await activateBuildingTrail(this.ladder!, activationPrice);
         await runRefreshExits(this.buildHost());
         await persistLadderState(this.ladder);
       }).catch((e) => logger.error('Error activating building trail', { error: e }));
       return;
     }
 
+    // Floor / giveback exits are not throttled — protect profit on fast reversals.
+    if (this.ladder && awaitingTrailGivebackBreached(this.ladder, price, this.tickSize)) {
+      this.runExclusive(async () => {
+        await executeAwaitingTrailGivebackClose(this.ladder!, price, this.tickSize);
+      }).catch((e) => logger.error('Error on awaiting-trail giveback close', { error: e }));
+      return;
+    }
+
+    if (
+      this.ladder &&
+      this.ladder.buildingTrailActive &&
+      buildingTrailFloorBreached(this.ladder, price, this.tickSize)
+    ) {
+      this.runExclusive(async () => {
+        await executeBuildingTrailFloorClose(this.ladder!, price, this.tickSize);
+      }).catch((e) => logger.error('Error on building trail floor close', { error: e }));
+      return;
+    }
+
     const now = Date.now();
-    if (now - this._lastTrailEval < 5_000) return;
+    if (now - this._lastTrailEval < TRAIL_EVAL_INTERVAL_MS) return;
     this._lastTrailEval = now;
 
     if (canEvaluatePartialClose(this.ladder)) {
@@ -403,18 +433,6 @@ export const botEngine = {
           await persistLadderState(this.ladder);
         }
       }).catch((e) => logger.error('Error in price tick evaluation', { error: e }));
-      return;
-    }
-
-    if (
-      this.ladder &&
-      !this._refreshingExits &&
-      this.ladder.buildingTrailActive &&
-      buildingTrailFloorBreached(this.ladder, price, this.tickSize)
-    ) {
-      this.runExclusive(async () => {
-        await executeBuildingTrailFloorClose(this.ladder!, price, this.tickSize);
-      }).catch((e) => logger.error('Error on building trail floor close', { error: e }));
       return;
     }
 
@@ -490,7 +508,7 @@ export const botEngine = {
 
       if (pos.qty > 0) {
         logger.info(`[Sync] In position: ${pos.side} ${pos.qty} @ ${pos.entry}`);
-        orderBookCollector.onPrice = (p) => this.onPriceTick(p);
+        this.ensurePriceWatch();
         await orderBookCollector.ensureDepthCollection(SYMBOL);
 
         const openEntryCount = countExchangeEntryOrders(openOrders);
@@ -585,6 +603,13 @@ export const botEngine = {
         }
 
         if (!hasSL || !hasTP || repairedHarvest || this.state.phase !== syncPhase) {
+          const watchPrice = orderBookCollector.currentPrice;
+          if (watchPrice > 0 && this.ladder && isAwaitingBuildingTrail(this.ladder)) {
+            ratchetAwaitingTrailPeak(this.ladder, watchPrice);
+            if (await tryActivateBuildingTrailIfNeeded(this.ladder, watchPrice)) {
+              logger.info(`[Sync] Trail armed from restored peak @ ${watchPrice}`);
+            }
+          }
           if (repairedHarvest && hasSL && hasTP) {
             logger.warn('[Sync] Harvest state repaired — re-placing exits at harvest % (was building SL)');
           } else if (this.state.phase !== syncPhase) {
@@ -602,7 +627,7 @@ export const botEngine = {
 
         if (this.state.phase === 'WAITING_ENTRY' && entryOrdersOpen) {
           logger.info('[Sync] STRADDLE phase — waiting for first entry fill.');
-          orderBookCollector.onPrice = (p) => this.onPriceTick(p);
+          this.ensurePriceWatch();
           await orderBookCollector.ensureDepthCollection(SYMBOL);
         } else if (this.state.status === 'RUNNING') {
           logger.info('[Sync] No position. Starting fresh COLLECTING phase.');

@@ -314,3 +314,5 @@ ecosystem.config.cjs   PM2: un proceso por estrategia (producción)
 
 Lee docs/REFERENCIA-IA-ESTRATEGIAS.md y docs/estrategias-plan-implementacion.md.
 Estrategia: momentum. Objetivo: <tu cambio>.
+
+revisa el documento @docs/arquitectura-ingesta-datos-backtest.md y mira si todo esta bien o si tiene mejoras, nos busques nada mas en el proyecti actual, solo ten en cuenta tu experiencia  y conocimiento en general siobre el tema
