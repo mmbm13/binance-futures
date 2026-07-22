@@ -24,20 +24,20 @@ describe('computeExitPrices', () => {
 
   it('uses stable full-ladder SL at avg entry with fixed max loss beyond deepest', () => {
     const projection = {
-      avgEntry: 1692.73,
-      qty: 0.051,
+      avgEntry: 1695,
+      qty: 0.032,
       deepestPrice: 1710,
       prices: [1670, 1690, 1710],
-      quantities: [0.011, 0.016, 0.024],
+      quantities: [0.007, 0.01, 0.015],
     };
-    const exits = computeExitPrices('SHORT', 1670, 0.011, 0.81, 0.01, 1.5, {
+    const exits = computeExitPrices('SHORT', 1670, 0.007, 0.81, 0.01, 1.5, {
       buildingSlProjection: projection,
     });
 
     assert.equal(exits.skipSl, false);
     assert.ok(Math.abs(exits.slTargetUsd - 0.81) < 0.02);
-    assert.ok(exits.slPrice > 1710 + 0.04);
-    assert.ok(exits.slPrice < 1720);
+    assert.ok(exits.slPrice >= 1710 * 1.005 - 1e-9);
+    assert.ok(exits.slPrice < 1725);
   });
 
   it('defers building SL until all ladder orders are placed', () => {

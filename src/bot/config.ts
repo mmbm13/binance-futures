@@ -52,8 +52,8 @@ export const TAKER_FEE = Number(process.env.TAKER_FEE || 0.0005);
 export const NOTIONAL_MULTIPLIER = Number(process.env.NOTIONAL_MULTIPLIER || 1.0);
 export const MIN_LADDER_SPACING_PCT = Number(process.env.MIN_LADDER_SPACING_PCT || 0.005);
 export const MAX_LADDER_SPACING_PCT = Number(process.env.MAX_LADDER_SPACING_PCT || 0.01);
-/** Min ticks between deepest ladder rung and building SL (avoids SL on same price as last order). */
-export const MIN_SL_GAP_TICKS = Number(process.env.MIN_SL_GAP_TICKS || 5);
+/** Min gap between deepest ladder rung and building SL as a fraction of deepest price (0.005 = 0.5%). */
+export const MIN_SL_GAP_PCT = Number(process.env.MIN_SL_GAP_PCT || 0.005);
 
 export const SIZE_MULTIPLIERS = Array.from(
   { length: LADDER_LEVELS },
@@ -65,6 +65,9 @@ export function validateConfig(): void {
   if (LADDER_LEVELS < 2) throw new Error(`LADDER_LEVELS must be >= 2 (got ${LADDER_LEVELS})`);
   if (LADDER_SIZE_MULT <= 1) throw new Error(`LADDER_SIZE_MULT must be > 1 (got ${LADDER_SIZE_MULT})`);
   if (SIZE_MULT_SUM <= 0) throw new Error('Invalid ladder sizing configuration');
+  if (!(MIN_SL_GAP_PCT > 0) || MIN_SL_GAP_PCT >= 1) {
+    throw new Error(`MIN_SL_GAP_PCT must be in (0, 1) (got ${MIN_SL_GAP_PCT})`);
+  }
 }
 
 validateConfig();

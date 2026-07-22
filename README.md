@@ -283,7 +283,7 @@ npx tsc --noEmit     # type-check
 ```
 
 > Nota: algunos tests de geometría del ladder son sensibles a valores extremos en tu
-> `.env` local (p. ej. `MIN_SL_GAP_TICKS` muy alto los hace fallar). Los defaults de
+> `.env` local (p. ej. `MIN_SL_GAP_PCT` muy alto los hace fallar). Los defaults de
 > los `*.example` pasan la suite completa.
 
 ## Estructura del proyecto

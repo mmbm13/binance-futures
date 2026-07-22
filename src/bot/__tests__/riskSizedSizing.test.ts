@@ -4,7 +4,6 @@ import {
   computeGeometricLadderQuantities,
   computeRiskSizedLadderQuantities,
   buildingSlPrice,
-  projectedSlPrice,
   slBeyondDeepestRung,
   validateLadderQuantities,
   validateRiskSizedLadder,
@@ -13,6 +12,8 @@ import {
 import { projectFullLadder } from '../ladder/projection';
 import { computeExitPrices } from '../phases/exitPricing';
 import { makeLadder } from './helpers';
+
+const GAP_PCT = 0.005;
 
 describe('validateLadderQuantities', () => {
   it('rejects qty below minQty', () => {
@@ -65,7 +66,7 @@ describe('validateLadderWithSlGeometry', () => {
     const result = validateLadderWithSlGeometry(
       prices,
       'SHORT',
-      0.011,
+      0.007,
       0.81,
       0.001,
       0.001,
@@ -73,8 +74,8 @@ describe('validateLadderWithSlGeometry', () => {
       0.01
     );
     assert.equal(result.valid, true);
-    assert.deepEqual(result.quantities, [0.011, 0.016, 0.024]);
-    assert.ok(slBeyondDeepestRung(result.quantities!, prices, 'SHORT', 0.81, 0.01));
+    assert.deepEqual(result.quantities, [0.007, 0.009, 0.011]);
+    assert.ok(slBeyondDeepestRung(result.quantities!, prices, 'SHORT', 0.81, 0.01, GAP_PCT));
   });
 
   it('rejects default baseQty when SL would sit on deepest rung', () => {
@@ -126,34 +127,34 @@ describe('computeRiskSizedLadderQuantities', () => {
       0.014
     );
     const fixedGeom = [0.014, 0.021, 0.031];
-    assert.ok(!slBeyondDeepestRung(fixedGeom, prices, 'SHORT', 0.81, 0.01));
+    assert.ok(!slBeyondDeepestRung(fixedGeom, prices, 'SHORT', 0.81, 0.01, GAP_PCT));
     assert.ok(defaultMult[2] < fixedGeom[2]);
   });
 
   it('buildingSlPrice returns null when geometry is infeasible', () => {
     const prices = [1670, 1690, 1710];
     const qtys = [0.014, 0.021, 0.031];
-    assert.equal(buildingSlPrice(qtys, prices, 'SHORT', 0.81, 0.01), null);
+    assert.equal(buildingSlPrice(qtys, prices, 'SHORT', 0.81, 0.01, GAP_PCT), null);
   });
 
   it('buildingSlPrice returns price strictly beyond deepest when valid', () => {
     const prices = [1670, 1690, 1710];
-    const qtys = [0.011, 0.016, 0.024];
-    const sl = buildingSlPrice(qtys, prices, 'SHORT', 0.81, 0.01);
+    const qtys = [0.007, 0.01, 0.015];
+    const sl = buildingSlPrice(qtys, prices, 'SHORT', 0.81, 0.01, GAP_PCT);
     assert.ok(sl !== null);
-    assert.ok(sl! > 1710 + 0.04);
+    assert.ok(sl! >= 1710 * (1 + GAP_PCT) - 1e-9);
   });
 });
 
 describe('full ladder SL with risk-sized qty', () => {
   it('projects exits with monotonic order qty and SL beyond deepest', () => {
     const prices = [1670, 1690, 1710];
-    const qtys = computeGeometricLadderQuantities(3, 0.011, 0.001, 1.5, 0.011);
-    assert.ok(slBeyondDeepestRung(qtys, prices, 'SHORT', 0.81, 0.01));
+    const qtys = computeGeometricLadderQuantities(3, 0.007, 0.001, 1.5, 0.007);
+    assert.ok(slBeyondDeepestRung(qtys, prices, 'SHORT', 0.81, 0.01, GAP_PCT));
 
     const ladder = makeLadder({
       side: 'SHORT',
-      baseQty: 0.011,
+      baseQty: 0.007,
       riskAmount: 0.81,
       entryOrders: [
         { clientOrderId: 'a', side: 'SELL', price: 1670, qty: qtys[0], status: 'FILLED' },
@@ -163,7 +164,7 @@ describe('full ladder SL with risk-sized qty', () => {
     });
 
     const projection = projectFullLadder(ladder, 3, 0.001)!;
-    const exits = computeExitPrices('SHORT', 1670, 0.014, 0.81, 0.01, 1.5, {
+    const exits = computeExitPrices('SHORT', 1670, 0.007, 0.81, 0.01, 1.5, {
       buildingSlProjection: {
         avgEntry: projection.avgEntry,
         qty: projection.totalQty,
@@ -174,7 +175,7 @@ describe('full ladder SL with risk-sized qty', () => {
     });
 
     assert.ok(projection.levels[1].qty > projection.levels[0].qty);
-    assert.ok(exits.slPrice > projection.deepestPrice);
+    assert.ok(exits.slPrice >= projection.deepestPrice * (1 + GAP_PCT) - 1e-9);
     assert.ok(Math.abs(exits.slTargetUsd - 0.81) < 0.05);
   });
 });

@@ -1,4 +1,4 @@
-import { MIN_SL_GAP_TICKS, LADDER_LEVELS, LADDER_SIZE_MULT, NOTIONAL_MULTIPLIER, SIZE_MULT_SUM } from '../config';
+import { MIN_SL_GAP_PCT, LADDER_LEVELS, LADDER_SIZE_MULT, NOTIONAL_MULTIPLIER, SIZE_MULT_SUM } from '../config';
 import { ceilStep, floorStep } from '../math';
 
 export function computeBaseQty(
@@ -51,9 +51,13 @@ export function projectedSlPrice(
   return side === 'SHORT' ? avg + dist : avg - dist;
 }
 
-/** Min price gap between deepest rung and risk-based SL. */
-export function minSlGapPrice(tickSize: number, gapTicks: number = MIN_SL_GAP_TICKS): number {
-  return tickSize * Math.max(1, gapTicks);
+/** Min price gap between deepest rung and risk-based SL (fraction of deepest). */
+export function minSlGapPrice(
+  deepestPrice: number,
+  tickSize: number,
+  gapPct: number = MIN_SL_GAP_PCT
+): number {
+  return Math.max(tickSize, deepestPrice * Math.max(0, gapPct));
 }
 
 /** True when risk-based SL (avg ± risk/Q) sits beyond the deepest rung before rounding. */
@@ -63,12 +67,12 @@ export function slBeyondDeepestRung(
   side: 'LONG' | 'SHORT',
   riskAmount: number,
   tickSize: number,
-  gapTicks: number = MIN_SL_GAP_TICKS
+  gapPct: number = MIN_SL_GAP_PCT
 ): boolean {
   if (quantities.length === 0 || prices.length === 0) return false;
   const deepest = side === 'SHORT' ? Math.max(...prices) : Math.min(...prices);
   const sl = projectedSlPrice(quantities, prices, side, riskAmount);
-  const gap = minSlGapPrice(tickSize, gapTicks);
+  const gap = minSlGapPrice(deepest, tickSize, gapPct);
   return side === 'SHORT' ? sl >= deepest + gap - 1e-9 : sl <= deepest - gap + 1e-9;
 }
 
@@ -82,9 +86,9 @@ export function buildingSlPrice(
   side: 'LONG' | 'SHORT',
   riskAmount: number,
   tickSize: number,
-  gapTicks: number = MIN_SL_GAP_TICKS
+  gapPct: number = MIN_SL_GAP_PCT
 ): number | null {
-  if (!slBeyondDeepestRung(quantities, prices, side, riskAmount, tickSize, gapTicks)) {
+  if (!slBeyondDeepestRung(quantities, prices, side, riskAmount, tickSize, gapPct)) {
     return null;
   }
 
@@ -428,7 +432,7 @@ export function formatLadderSizingError(
     case 'sl_geometry_infeasible':
       return (
         `ladder span exceeds risk budget at ${ladderLevels} levels ` +
-        `(cannot place SL beyond deepest rung with max loss intact)`
+        `(cannot place SL beyond deepest rung by MIN_SL_GAP_PCT with max loss intact)`
       );
     case 'empty':
       return 'no ladder prices to size';

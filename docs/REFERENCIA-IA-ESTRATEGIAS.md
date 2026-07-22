@@ -384,7 +384,7 @@ docs/
 
 | Problema | Detalle |
 |---|---|
-| Tests ladder fallan localmente | `.env` con `MIN_SL_GAP_TICKS=800` rompe geometría SL — usar defaults de `*.example` |
+| Tests ladder fallan localmente | `.env` con `MIN_SL_GAP_PCT` muy alto rompe geometría SL — usar defaults de `*.example` |
 | `updatePhase('IDLE')` | Borra `orders` JSONB — no usar en estrategias nuevas |
 | Ladder + paper | Registry lanza error — usar `USE_TESTNET=true` |
 | Liquidaciones Binance | Stream `@forceOrder` emite máx 1 evento/s/símbolo (muestra, no total) |
